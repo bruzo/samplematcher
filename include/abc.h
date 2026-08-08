@@ -1,0 +1,880 @@
+#ifndef ABC_H
+#define ABC_H
+
+// Class to handle everything about the input of ABC Files: loading / parsing and turning it into playable information for the audioplayer
+
+#include<vector>
+#include<list>
+#include<string>
+#include<map>
+
+#include "brutedefinitions.h"
+
+
+// ***************************   Necessary functions
+
+
+class ABCHeaderT
+{
+public:
+    void SetStereoPosition(int pos);
+    int GetStereoPosition();
+    void SetDepthPosition(int pos);
+    int GetDepthPosition();
+    void SetID(int id);
+    int GetID();
+    void SetSpeed(int speed);
+    int GetSpeed();
+    void SetUnitLength(double unit);
+    double GetUnitLength();
+    void SetX(int x);
+    int GetX();
+    void SetInstrument(int i);
+    int GetInstrument();
+
+    void ParseLine(std::string line);
+    double GetBeatsToSeconds();
+
+    
+
+private:
+    int m_StereoPosition = 0;
+    int m_DepthPosition = 300;
+    int m_ID = 0;
+    int m_Speed = 125;
+    double m_UnitLength = 1.0/8.0;
+    double m_Measure = 1.0;
+    double m_MeasureDiv = 4.0;
+    int m_Xnumber;
+    int m_Instrument=0;
+
+    std::vector<size_t> m_originalpartnumber;
+};
+
+double ABCHeaderT::GetBeatsToSeconds()
+{
+    return 60.0/m_Speed * m_UnitLength *  m_MeasureDiv ;  // probably only correct for BruTE tunes ...
+}
+
+void ABCHeaderT::SetInstrument(int i)
+{
+    m_Instrument = i;
+}
+
+int ABCHeaderT::GetInstrument()
+{
+    return m_Instrument;
+}
+
+void ABCHeaderT::SetStereoPosition(int pos)
+{
+    m_StereoPosition = pos;
+}
+
+int ABCHeaderT::GetStereoPosition()
+{
+    return m_StereoPosition;
+}
+
+void ABCHeaderT::SetDepthPosition(int pos)
+{
+    m_DepthPosition = pos;
+}
+
+int ABCHeaderT::GetDepthPosition()
+{
+    return m_DepthPosition;
+}
+
+void ABCHeaderT::SetID(int id)
+{
+    m_ID = id;
+}
+
+int ABCHeaderT::GetID()
+{
+    return m_ID;
+}
+
+void ABCHeaderT::SetSpeed(int speed)
+{
+    m_Speed = speed;
+}
+
+int ABCHeaderT::GetSpeed()
+{
+    return m_Speed;
+}
+
+void ABCHeaderT::SetUnitLength(double unit)
+{
+    m_UnitLength = unit;
+}
+double ABCHeaderT::GetUnitLength()
+{
+    return m_UnitLength;
+}
+
+void ABCHeaderT::SetX(int x)
+{
+    m_Xnumber = x;
+}
+int ABCHeaderT::GetX()
+{
+    return m_Xnumber;
+}
+
+void ABCHeaderT::ParseLine(std::string line)
+{
+    if (line[1] == ':')
+    {
+        // X: field
+        if (line[0]=='X')
+        {
+            try {
+                m_Xnumber = std::stoi(line.substr(2));
+            }
+            catch (const std::invalid_argument& ia)
+            {
+               m_Xnumber = 0;
+            } catch (const std::out_of_range& oor)
+            {
+               m_Xnumber = 0;
+            }
+        }
+
+        // Q: field
+        if (line[0]=='Q')
+        {
+            size_t j = 2;
+            for (size_t i = 0; i < line.size(); i++) if (line[i]=='=') j = i;
+            try {
+                m_Speed = std::stoi(line.substr(j));
+            }
+            catch (const std::invalid_argument& ia)
+            {
+               m_Speed = 120;
+            } catch (const std::out_of_range& oor)
+            {
+               m_Speed = 120;
+            }
+        }
+        // L: field
+        if (line[0]=='L')
+        {
+            auto factors = split(line.substr(2),'/');
+            double unit = 1.0;
+            if (factors.size()> 0)
+            {
+               try
+               {
+                   unit = unit * std::stoi(factors[0]);
+               }
+               catch (const std::invalid_argument& ia){}
+               catch (const std::out_of_range& oor){}
+            }
+            if (factors.size()>1)
+            {
+               try
+               {
+                   unit = unit / std::stoi(factors[1]);
+               }
+               catch (const std::invalid_argument& ia){}
+               catch (const std::out_of_range& oor){}
+            }
+            m_UnitLength = unit;
+           // std::cout << "Unit " << m_UnitLength << std::endl;
+        }
+
+        
+        // see if we can find the instrument in here
+        if (line[0]=='T')
+        {
+            // this is the instrument line!
+            try{
+               m_Instrument = GetABCInstrumentFromTLine(line);
+            }
+            catch (const std::invalid_argument& ia){ m_Instrument = 0;}
+            catch (const std::out_of_range& oor){m_Instrument = 0;}
+        }
+
+        // see if we can find stereo positions in here
+        if (line[0]=='Z')
+        {
+          // std::cout << line << std::endl;
+           auto arguments = split(line.substr(2),' ');
+           int one = 0;
+           int two = 0;
+           int three = 0;
+           bool failure = false;
+
+           // the BruTE Z line has at least 4 entries, so only try this if it's like this
+           if (arguments.size() > 3)
+           {
+               try
+               {
+                   three = std::stoi(arguments.back());
+               }
+               catch (const std::invalid_argument& ia){ failure = true;}
+               catch (const std::out_of_range& oor){failure = true;}
+
+               if (!failure)
+               {
+                   // we have a number in the end!
+                   try
+                   {
+                      two = std::stoi( arguments[ arguments.size()-2]);
+                   }
+                   catch (const std::invalid_argument& ia){ failure = true;}
+                   catch (const std::out_of_range& oor){failure = true;}
+
+                   if (!failure)
+                   {
+                       // there was actually two numbers in the end of the line
+                       try
+                       {
+                           one = std::stoi( arguments[arguments.size()-3]);
+                       }
+                       catch (const std::invalid_argument& ia){ failure = true;}
+                       catch (const std::out_of_range& oor){failure = true;}
+                       if (!failure)
+                       {
+                           // we got 3 numbers!!!
+                           m_StereoPosition = one;
+                           m_DepthPosition = two;
+                           m_ID = three;
+                       }
+                       else
+                       {
+                           // well .. we got 2 numbers .. but not a third, lets assume final is stereo and prefinal is Depth
+                           m_StereoPosition = three;
+                           m_DepthPosition = two;
+                           m_ID = -1;
+                       }
+                   }
+                   else
+                   {
+                       // seems we only had one number in the end, lets treat that as stereo panning
+                       two = 0;
+                       m_StereoPosition = static_cast<int>((three - 64.0)/64*50) ;
+                       m_DepthPosition = 300;
+                       m_ID = -1;
+                   }
+
+               }
+               else   // last is not a number, so we don't get anything from the Z-line
+               {
+                   m_StereoPosition = 0;
+                   m_DepthPosition = 300;
+                   m_ID = -1;
+               }
+           }
+           else
+           {
+               // this is not enough arguments anyway
+               m_StereoPosition = 0;
+               m_DepthPosition = 300;
+               m_ID = -1;
+           }
+         //  std::cout << m_StereoPosition << "  " << m_DepthPosition << "  " << m_ID << std::endl;
+        }
+
+
+                // L: field
+        if (line[0]=='M')
+        {
+            auto factors = split(line.substr(2),'/');
+            
+            if (factors.size()> 0)
+            {
+               try
+               {
+                   m_Measure = std::stoi(factors[0]);
+               }
+               catch (const std::invalid_argument& ia){}
+               catch (const std::out_of_range& oor){}
+            }
+            if (factors.size()>1)
+            {
+               try
+               {
+                   m_MeasureDiv = std::stoi(factors[1]);
+               }
+               catch (const std::invalid_argument& ia){}
+               catch (const std::out_of_range& oor){}
+            }
+            
+           // std::cout << "Unit " << m_Measure << "  " << m_MeasureDiv << std::endl;
+        }
+
+    }
+}
+
+
+
+class ABCInput
+{
+public:
+
+   void LoadABC(std::stringstream * abctext);
+   void LoadABC(std::string filename);
+   void LoadToneTuples(std::vector<std::vector<ToneTuple>> toneTuples);
+
+   std::vector< std::vector< ToneTuple > > m_ABCTonesvector = {};
+
+   std::vector< std::vector<uint32_t> > m_ToneCounts;  // to measure occupancy in 50ms blocks
+   std::vector< uint32_t> m_TotalToneCounts;
+   std::string  CorrectForMaestro(std::string abctext);
+
+
+
+   std::size_t Nabctracks();
+
+   int64_t GetDuration();
+
+   int GetStereoPosition(int abctrack);
+   void SetStereoPosition(int abctrack, int value);
+
+   int GetDepthPosition(int abctrack);
+   void SetDepthPosition(int abctrack, int value);
+
+   int GetID(int abctrack);
+   void SetID(int abctrack, int value);
+
+   int GetX(int abctrack);
+   void SetX(int abctrack, int value);
+
+   int GetInstrument(int abctrack);
+   void SetInstrument(int abctrack, int value);
+
+   void UpdateToneCounts();
+   bool AudioReady = false;
+   bool AudioRedrawn = false;
+
+   std::vector<size_t> GetOriginalPartNumbers();
+
+private:
+
+   std::size_t m_Nabctracks = 0;
+
+   std::vector< ABCHeaderT > m_abcheaders;
+
+   int64_t m_durationseconds = 0;
+
+   std::vector< size_t > m_originalpartnumbers;
+
+};
+
+std::vector<size_t> ABCInput::GetOriginalPartNumbers()
+{
+    return m_originalpartnumbers;
+}
+
+void ABCInput::UpdateToneCounts()
+{
+   int64_t chunks = ((m_durationseconds+2) * 1000) / 50;
+
+   m_ToneCounts.resize( m_Nabctracks );
+   for (size_t i = 0; i < m_Nabctracks; i++) m_ToneCounts[i].resize(chunks, 0);
+
+   for (size_t i = 0; i < m_Nabctracks; i++)
+   {
+      for (size_t j= 0; j < m_ABCTonesvector[i].size(); j++)
+      {
+          int64_t tonestart = std::get<1>(m_ABCTonesvector[i][j]);
+          int64_t toneduration = std::get<2>(m_ABCTonesvector[i][j]);
+
+          int64_t chunkstart = ( (tonestart * 1000) / (44100*50) );
+          int64_t chunkduration = ( toneduration * 1000 ) / (44100*50);
+
+          int instrunumber = GetInstrument(i);
+
+          if (  fadeouttype[ instrunumber ] == 0 )
+          {
+              // this is a constant duration instrument
+              size_t loopend = chunkstart + fadeout[instrunumber];
+              if (loopend >= m_ToneCounts[i].size()) loopend = m_ToneCounts[i].size() ;
+
+              for (size_t m = chunkstart; m < loopend; m++) m_ToneCounts[i][m] += 1;
+          }
+          else
+          {
+              size_t loopend = chunkstart + chunkduration + fadeout[instrunumber];
+              if (loopend >= m_ToneCounts[i].size()) loopend = m_ToneCounts[i].size() ;
+              // this is a continuous instrument
+              for (size_t m = chunkstart; m < loopend; m++) m_ToneCounts[i][m] += 1;
+        }
+      }
+   }
+   m_TotalToneCounts.resize(691);
+   std::fill(m_TotalToneCounts.begin(), m_TotalToneCounts.end(), 0);
+   float chunksperpixel =  690.0 / m_ToneCounts[0].size();
+
+   for ( uint64_t i = 0; i < m_ToneCounts[0].size(); i++ )
+   {
+        // count full number of tones per slot and pick largest
+      uint32_t val = 0;
+      for (size_t j = 0; j < m_ToneCounts.size(); j++) // loop over tracks
+      {
+         val = val + m_ToneCounts[j][i];
+      }
+      if (val > 99) val = 99;
+      size_t position = size_t(i * chunksperpixel);
+      if ( val > m_TotalToneCounts[position] ) m_TotalToneCounts[position] = val;
+   }
+
+
+   AudioReady = true;
+   AudioRedrawn = false;
+}
+
+int ABCInput::GetInstrument(int abctrack)
+{
+    return m_abcheaders[abctrack].GetInstrument();
+}
+
+void ABCInput::SetInstrument(int abctrack, int value)
+{
+    m_abcheaders[abctrack].SetInstrument(value);
+}
+
+void ABCInput::SetX(int abctrack, int value)
+{
+    m_abcheaders[abctrack].SetX(value);
+}
+
+int ABCInput::GetX(int abctrack)
+{
+    return m_abcheaders[abctrack].GetX();
+}
+
+int ABCInput::GetID(int abctrack)
+{
+    return m_abcheaders[abctrack].GetID();
+}
+
+void ABCInput::SetID(int abctrack, int value)
+{
+    m_abcheaders[abctrack].SetID(value);
+}
+
+
+int ABCInput::GetDepthPosition(int abctrack)
+{
+    return m_abcheaders[abctrack].GetDepthPosition();
+}
+
+void ABCInput::SetDepthPosition(int abctrack, int value)
+{
+    m_abcheaders[abctrack].SetDepthPosition(value);
+}
+
+
+int ABCInput::GetStereoPosition(int abctrack)
+{
+    return m_abcheaders[abctrack].GetStereoPosition();
+}
+
+void ABCInput::SetStereoPosition(int abctrack, int value)
+{
+    m_abcheaders[abctrack].SetStereoPosition(value);
+}
+
+int64_t ABCInput::GetDuration()
+{
+    return m_durationseconds;
+}
+
+std::size_t ABCInput::Nabctracks()
+{
+    return m_Nabctracks;
+}
+
+
+
+std::string ABCInput::CorrectForMaestro(std::string abctext)
+{
+   std::stringstream inabc(abctext);
+   std::stringstream outabc("");
+   std::string line;
+   std::vector<int> status(12,1);
+   const std::vector<std::string> prefix = {"_","=","^"};
+   outabc << "%Maestro" << std::endl;
+   while (std::getline( inabc , line))
+   {
+       //std::cout << "Original Line " << std::endl;
+      // std::cout << line << std::endl;
+       
+       if (!line.empty() && line.front() == '\t') {
+           line.erase(0, 1);
+       }
+
+       if ((line[0] != '%')&&(line.size()>0)) // we discard comments and empty lines
+       {
+          // std::cout << "New Line " << std::endl;
+
+           if ((line[0] == 'X' )&&(line[1]==':'))
+           {
+               outabc << std::endl;
+           }
+
+           if (line[1]==':') // we keep header lines
+           {
+               outabc << line << std::endl;
+        //      std::cout << line << std::endl;
+           }
+           else
+           {
+              // this is a songbody line, we break it down into singular instructions
+              auto lines = split(line, ' ');
+
+              for (auto myline : lines)
+              {
+              
+                  if (myline.empty()) continue; // Prevent out-of-bounds on split() artifacts
+                  
+                  
+                  // Reset status table for this line
+                  std::fill(status.begin(), status.end(), 1);
+                  
+                  // replaced line with std:fill
+                  //for (size_t k = 0; k < status.size(); k++) status[k] = 1;
+
+                  
+                  // std::cout << myline << std::endl;
+                  // if we hit the end of a measure we wipe the status of ^_= 
+                  if (myline[0]=='|')
+                  {
+                      // wiping status
+                      for (size_t k = 0; k < status.size(); k++) status[k] = 1;
+                  }
+                  else
+                  {
+                     if ((myline[0] == '+')|(myline[0]=='z')) // this is a velocity change, so we just keep it
+                     {
+                 //       std::cout << myline << std::endl;
+                         outabc << myline << std::endl;
+                     }
+                     else
+                     {
+                         // this is either a chord or a singular tone
+                         if (myline[0] != '[')
+                         {
+                             // singular tone
+                             bool changed = false;
+                             if (myline[0] == '^') {
+                                    status[LetterIndex(myline[1])] = 2; changed = true;
+                             }
+                             if (myline[0] == '=') {
+                                    status[LetterIndex(myline[1])] = 1; changed = true;
+                             }
+                             if (myline[0] == '_') {
+                                    status[LetterIndex(myline[1])] = 0; changed = true;
+                             }
+                             if (changed)
+                             {
+                                 outabc <<"[" << myline << "]"  <<std::endl;
+                      //           std::cout << "[" <<myline << "]" <<std::endl;
+                             }
+                             else
+                             {
+                                 outabc <<"[" << prefix[ status[LetterIndex(myline[0])] ] << myline <<"]" << std::endl;
+                        //         std::cout<<"[" << prefix[ status[LetterIndex(myline[0])] ] << myline << "]"<<std::endl;
+                             }
+
+                         }
+                         else
+                         {   // we now go through char by char
+                             for (size_t k =1; k < myline.size()-1; k++)
+                             {
+                                 // is this a letter not preceeded by a relative changer?
+                                 if (( LetterIndex(myline[k])>-1 ) && (  !IsRel(  myline[k-1] )  ))
+                                 {
+                                     // then insert one!
+                                     myline.insert(k, prefix[  status[LetterIndex(myline[k]) ]]  );
+                                 }
+                                 // is this a letter preceeded by a relative changer?
+                                 if (( LetterIndex(myline[k])>-1 ) && (  IsRel(  myline[k-1] )  ))
+                                 {
+                                     // we keep this but we need to  keep track of changers
+                                     if (myline[k-1]=='^') status[LetterIndex(myline[k])] = 2;
+                                     if (myline[k-1]=='=') status[LetterIndex(myline[k])] = 1;
+                                     if (myline[k-1]=='_') status[LetterIndex(myline[k])] = 0;
+                                 }
+                             }
+                             outabc << myline << std::endl;
+                         //    std::cout << myline << std::endl;
+                         }
+                     }
+                  }
+              }
+           }
+       }
+   }
+   outabc << std::endl;
+   outabc << std::endl;
+   return outabc.str();
+}
+
+// Load a tonetuple as ABC
+void ABCInput::LoadToneTuples(std::vector<std::vector<ToneTuple>> toneTuples)
+{
+    m_ABCTonesvector = toneTuples;
+
+    // Raise all velocities by 1.0
+    for (auto& track : m_ABCTonesvector)
+        for (auto& tone : track)
+            std::get<5>(tone) += 1.0f;
+
+    m_Nabctracks = toneTuples.size();
+
+    // Initialize the headers vector
+    m_abcheaders.resize(m_Nabctracks);
+
+
+    m_originalpartnumbers = std::vector<size_t>(m_Nabctracks);
+    for (size_t i = 0; i < m_Nabctracks; i++)
+    {
+        m_originalpartnumbers[i] = i;
+        m_abcheaders[i].SetID(i + 1);
+    }
+
+    // Calculate duration in seconds from the tone tuples
+    m_durationseconds = 0;
+    for (size_t i = 0; i < m_Nabctracks; i++)
+    {
+        for (size_t j = 0; j < toneTuples[i].size(); j++)
+        {
+            if (std::get<0>(toneTuples[i][j]) + std::get<2>(toneTuples[i][j]) > m_durationseconds)
+            {
+                m_durationseconds = (std::get<0>(toneTuples[i][j]) + std::get<2>(toneTuples[i][j]));
+            }
+        }
+    }
+    
+    m_durationseconds /= 44100;
+}
+
+// Parse an ABC from a Stringstream
+void ABCInput::LoadABC(std::stringstream * abctext)
+{
+   // cast input stream into a std::string
+   std::string ABCString = abctext->str();
+
+
+   // in case this is a dos format text file, delete carriage returns \r
+   ABCString.erase(std::remove(ABCString.begin(), ABCString.end(), '\r'), ABCString.end());
+
+   // Check if this ABC was made with BrutE
+   bool Maestro = false;
+   bool Firefern = false;
+   if ( ABCString.find("Bruzo") == std::string::npos )
+   {
+       if (ABCString.find("Maestro")!= std::string::npos ) Maestro = true;
+
+       if (ABCString.find("Firefern")!=std::string::npos ) Firefern = true;
+   }
+
+   if (Maestro)
+   {
+     //  std::cout << " Was made with Maestro " << std::endl;
+       ABCString = CorrectForMaestro(ABCString);
+   }
+
+   if (Firefern)
+   {
+       ABCString = CorrectForMaestro(ABCString);
+     //  std::cout << " Was made with Firefern " << std::endl;
+   }
+
+   this->m_Nabctracks = Frequency_Substr(ABCString, "X:");
+   //std::cout << "ABC IMPORT The ABC has " <<  this->m_Nabctracks << " Tracks." << std::endl;
+
+   m_originalpartnumbers.clear();
+   m_originalpartnumbers.reserve(m_Nabctracks);
+
+   size_t pos = 0;
+   while ((pos = ABCString.find("X:", pos)) != std::string::npos)
+   {
+       pos += 2; // skip "X:"
+       while (pos < ABCString.length() && isspace(static_cast<unsigned char>(ABCString[pos])))
+           pos++;
+       size_t num_start = pos;
+       while (pos < ABCString.length() && isdigit(static_cast<unsigned char>(ABCString[pos])))
+           pos++;
+       if (pos > num_start)
+       {
+           m_originalpartnumbers.push_back(static_cast<size_t>(std::stoul(ABCString.substr(num_start, pos - num_start))));
+       }
+   }
+
+   // ABC Track information arrays
+   m_abcheaders.clear();
+   m_abcheaders.resize(m_Nabctracks);
+
+   // ABC Track tone info
+   m_ABCTonesvector.clear();
+   m_ABCTonesvector.resize(m_Nabctracks);
+
+   // Cut the full text into the ABC parts starting with X:
+   std::vector<std::string> ABCTracks = ABCTextArray(ABCString, "X:");
+
+   // Debug print to double check ABCTracks
+   /*
+   std::cout << "ABCTracks after splitting by 'X:':" << std::endl;
+   for (size_t i = 0; i < ABCTracks.size(); ++i) {
+       std::cout << "--- Track " << i << " ---" << std::endl << ABCTracks[i] << std::endl;
+   }
+   */
+
+   uint64_t finalsample = 0;
+
+   // ABCTracks[0] is the header of the ABC, usually containing information about the ABC transcoding program that was used, doesn't matter to us
+   //#pragma omp parallel for
+   for (size_t abctrack = 0; abctrack < m_Nabctracks; abctrack++)
+   {
+
+       // std::cout << "Starting Track " << abctrack << std::endl;
+       // We start with 0 tones in this track of course
+       m_ABCTonesvector[abctrack].resize(0);
+       m_ABCTonesvector[abctrack].clear();
+       m_ABCTonesvector[abctrack].reserve(100);
+
+       // we break it down into a list of lines
+       std::stringstream alllines;
+       alllines << ABCTracks[abctrack+1];
+
+       std::vector< std::string > mytracklines;
+       std::vector< std::string > mytrackheader;
+       ABCSplitHeaderBody(alllines, mytracklines, mytrackheader);
+       // std::cout << "ABC cut down " << abctrack << std::endl;
+
+       // Assign header info to this abctrack header
+       for (auto line : mytrackheader) m_abcheaders[abctrack].ParseLine(line);
+       //std::cout << "Lines Parsed" << std::endl;
+
+       // Now that we have parsed the header, lets see if some reasonable stereo positions are set, if not use default values
+       if ( m_abcheaders[abctrack].GetStereoPosition() == 0 )
+       {
+            int thisinstrument = m_abcheaders[abctrack].GetInstrument();
+            m_abcheaders[abctrack].SetStereoPosition(  default3Dpositions[thisinstrument][0]         );
+            m_abcheaders[abctrack].SetDepthPosition(  default3Dpositions[thisinstrument][1]         );
+            m_abcheaders[abctrack].SetID(  default3Dpositions[thisinstrument][2]         );
+       }
+
+       int16_t myinstrument = m_abcheaders[abctrack].GetInstrument();
+
+       double beat_to_seconds = m_abcheaders[abctrack].GetBeatsToSeconds();
+       //std::cout << "Beats to Seconds" << beat_to_seconds << " Should be 0.48 " << std::endl;
+       // Preparations to play the song and figure out tone starting/ending times
+
+       double currenttime = 0.;
+       int currentvelocity = 0; // corresponds to +pppp+
+
+       // this claviature holds tone starting times in samples @44.1KHz ( currenttime *0.5 * 44100 )
+       std::vector<int64_t> clavi;
+       clavi.resize(38); for (size_t i= 0; i < clavi.size(); i++) clavi[i] = -1;
+
+        // this claviature holds tone starting velocities
+       std::vector<int64_t> clavivel;
+       clavivel.resize(38); for (size_t i=0; i < clavivel.size(); i++) clavivel[i]=0;
+       //std::cout << "header of abctrack analyzed, going over tones " << std::endl;
+       // Now go through this abc track
+       for (auto line : mytracklines)
+       {
+          // std::cout << "This is my line: " << line << std::endl;
+          
+          // line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+
+           double myduration = 0.;        // so far this line has a 0 duration
+           std::vector<int16_t> pitchends = {}; // and so far this line has no ending pitches
+
+
+           // is this a velocity change?
+           if (IsVelchange( line )) {
+                 currentvelocity = Velocity( line );
+               //  std::cout << line << "  " << currentvelocity << std::endl;
+               //  if ((currentvelocity < 0) | (currentvelocity > 9)) std::cout << "Bad Velocity " << currentvelocity << " " << "-"<< line << "-" << std::endl;
+           } else
+           {
+           //   std::cout << " not a velchange " << std::endl;
+              // is this a break?
+              if (IsBreak(line))
+              {
+              //  std::cout << " this is break " << std::endl;
+                  myduration = BreakDuration(line) * beat_to_seconds;
+              }else
+              {
+               // std::cout << " not a break " << std::endl;
+              // if it is not a break and not a tempo change and we eliminated everything .. this should be a tone
+
+                 // std::cout << abctrack << " : " << line << std::endl;
+                  myduration = ChordDuration(line) * beat_to_seconds ;
+                 // std::cout << "Duration " << myduration << "  beatstosecs" << beat_to_seconds  <<  std::endl;
+                  std::vector<int16_t> pitches = GetPitches2(line);
+                //  std::cout << "Pitches " << std::endl;
+                //  for (size_t i = 0; i < pitches.size(); i++) std::cout << pitches[i] <<  "  ";
+                //  std::cout << std::endl;
+
+
+                  while (pitches.size() > 0)   // process them after each other
+                  {   // get pitch and continuation info for each pitch fired in this chord/tone
+                      int16_t cont = pitches.back(); pitches.pop_back();
+                      int16_t mypitch = pitches.back(); pitches.pop_back();
+
+                     // std::cout << mypitch << "  " << cont << std::endl;
+                      // if this tone doesn't run, we switch it on
+                    //  if ((mypitch < 0) | (mypitch>37)) std::cout<< "BAD PITCH " << mypitch << "  " <<"-" << line << "-" << std::endl;
+                      if ( !(clavi[mypitch] > -1) )
+                      {
+                          clavi[mypitch] = int64_t(  currenttime * 44100   );
+                          clavivel[mypitch] = currentvelocity;
+                      }
+
+                      if (cont == -1)
+                      {
+                          // this tone end will happen after this duration
+                         // std::cout << "mypitch  "  << mypitch << std::endl;
+                          int64_t myqduration = ( currenttime * 44100 - clavi[mypitch] ) + myduration * 44100;
+
+
+                          m_ABCTonesvector[abctrack].emplace_back(
+                               std::make_tuple(
+                                 static_cast<int64_t>(clavi[mypitch]), 
+                                 static_cast<int64_t>(clavi[mypitch]),  // starting time 2 times (redundant to be removed )
+                                 static_cast<int64_t>(myqduration),  // ending time
+                                 static_cast<int32_t>(myinstrument), // instrument number
+                                 static_cast<int32_t>(mypitch+36),       // pitch
+                                 static_cast<float>(clavivel[mypitch]) // velocity
+                                 ));
+
+                          if ( finalsample < static_cast<uint64_t>(clavi[mypitch] + myqduration) )
+                                   finalsample = clavi[mypitch] + myqduration;
+                          clavi[mypitch] = -1;
+                          clavivel[mypitch] = 0.;
+                      }
+                  }
+              }
+          }
+          currenttime = currenttime + myduration;
+          //std::cout << " time " << currenttime << std::endl;
+       }
+      // std::cout << " lines in track " << abctrack <<" finished " << std::endl;
+   }
+
+   m_durationseconds = finalsample / 44100;
+   // Turn the list into a vector and sort it by the tone starting times - not sure if that is necessary, but who knows
+   for (size_t i = 0; i < m_Nabctracks; i++)
+   {
+       std::sort( m_ABCTonesvector[i].begin(), m_ABCTonesvector[i].end() );
+   }
+  // std::cout << "ABC Tones read in " << std::endl;
+}
+
+void ABCInput::LoadABC(std::string filename)
+{
+
+}
+
+
+#endif
