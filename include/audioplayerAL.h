@@ -93,9 +93,10 @@ public:
     void ExportWAV(std::string * filename);
     std::vector<float> GenerateWAVMono();
     std::vector<float> GenerateWAVMonof();
-    std::vector<int32_t> GenerateWAVMonoI();
-    std::vector<int32_t> GenerateWAVMonoI_11();
-    std::vector<int32_t> ApplyToneDeltaMonoI(std::vector<int32_t> sampleBuf,
+    void GenerateWAVMonoI(std::vector<int32_t>& rightBuf);
+    void GenerateWAVMonoI_11(std::vector<int32_t>& rightBuf);
+    void ApplyToneDeltaMonoI(std::vector<int32_t>& destBuf,
+                                      const std::vector<int32_t>& srcBuf,
                                       const std::vector<ToneTuple>& added,
                                       const std::vector<ToneTuple>& deleted);
 
@@ -104,7 +105,8 @@ public:
                                       const std::vector<ToneTuple>& added,
                                       const std::vector<ToneTuple>& deleted);
 
-    std::vector<int32_t> ApplyToneDeltaMonoI_11(std::vector<int32_t> sampleBuf,
+    void ApplyToneDeltaMonoI_11(std::vector<int32_t>& destBuf,
+                                      const std::vector<int32_t>& srcBuf,
                                       const std::vector<ToneTuple>& added,
                                       const std::vector<ToneTuple>& deleted);
     std::vector<float> GenerateWAV();
@@ -194,7 +196,7 @@ private:
     // for the synchronization
     std::chrono::time_point<std::chrono::high_resolution_clock> m_ABC_Play_Start;       // this is when we started
     std::chrono::time_point<std::chrono::high_resolution_clock> m_ABC_Play_LastUpdate;  // this is where we are now
-    std::thread * PlayThread;
+    std::thread * PlayThread = nullptr;
 
     std::vector<uint64_t> trackpositions;
 
@@ -520,14 +522,15 @@ std::vector<float> AudioPlayerAL::GenerateWAVMonof()
 }
 
 
-std::vector<int32_t> AudioPlayerAL::GenerateWAVMonoI()
+void AudioPlayerAL::GenerateWAVMonoI(std::vector<int32_t>& rightBuf)
 {
     WaitForSamples();
 
     m.lock();
     if (myabc == NULL || m_Nabctracks == 0) {
         m.unlock();
-        return std::vector<int32_t>({});
+        rightBuf.clear();
+        return;
     }
     std::vector<std::vector<ToneTuple>> toneData = myabc->m_ABCTonesvector;
     int64_t durationSec = m_durationseconds;
@@ -536,7 +539,7 @@ std::vector<int32_t> AudioPlayerAL::GenerateWAVMonoI()
     m.unlock();
 
     uint64_t totalSamples = (durationSec + 5) * 44100;
-    std::vector<int32_t> rightBuf(totalSamples, 0);
+    rightBuf.assign(totalSamples, 0);
     int32_t* __restrict bufData = rightBuf.data();
 
     for (size_t i = 0; i < toneData.size(); i++)
@@ -616,18 +619,17 @@ std::vector<int32_t> AudioPlayerAL::GenerateWAVMonoI()
             }
         }
     }
-
-    return rightBuf;
 }
 
-std::vector<int32_t> AudioPlayerAL::GenerateWAVMonoI_11()
+void AudioPlayerAL::GenerateWAVMonoI_11(std::vector<int32_t>& rightBuf)
 {
     WaitForSamples();
 
     m.lock();
     if (myabc == NULL || m_Nabctracks == 0) {
         m.unlock();
-        return std::vector<int32_t>({});
+        rightBuf.clear();
+        return;
     }
     std::vector<std::vector<ToneTuple>> toneData = myabc->m_ABCTonesvector;
     int64_t durationSec = m_durationseconds;
@@ -637,7 +639,7 @@ std::vector<int32_t> AudioPlayerAL::GenerateWAVMonoI_11()
 
     // 1. Scale output sample layout down to 11025 Hz
     uint64_t totalSamples = (durationSec + 5) * 11025;
-    std::vector<int32_t> rightBuf(totalSamples, 0);
+    rightBuf.assign(totalSamples, 0);
     int32_t* __restrict bufData = rightBuf.data();
 
     for (size_t i = 0; i < toneData.size(); i++)
@@ -723,14 +725,14 @@ std::vector<int32_t> AudioPlayerAL::GenerateWAVMonoI_11()
             }
         }
     }
-
-    return rightBuf;
 }
 
-std::vector<int32_t> AudioPlayerAL::ApplyToneDeltaMonoI(std::vector<int32_t> sampleBuf,
+void AudioPlayerAL::ApplyToneDeltaMonoI(std::vector<int32_t>& destBuf,
+                                      const std::vector<int32_t>& srcBuf,
                                       const std::vector<ToneTuple>& added,
                                       const std::vector<ToneTuple>& deleted) {
-    size_t currentSize = sampleBuf.size();
+    destBuf.assign(srcBuf.begin(), srcBuf.end());
+    size_t currentSize = destBuf.size();
     size_t requiredMaxEnd = currentSize;
 
     // 1. Scan added tones to determine the absolute maximum required sample boundary
@@ -764,12 +766,12 @@ std::vector<int32_t> AudioPlayerAL::ApplyToneDeltaMonoI(std::vector<int32_t> sam
     if (requiredMaxEnd > currentSize) {
         size_t safetyPadding = 5 * 44100; 
         size_t targetSamples = requiredMaxEnd + safetyPadding;
-        sampleBuf.resize(targetSamples, 0);
+        destBuf.resize(targetSamples, 0);
     }
 
     float globalVolume = m_volume * 0.01f;
-    int32_t* __restrict bufData = sampleBuf.data();
-    size_t totalSamples = sampleBuf.size(); 
+    int32_t* __restrict bufData = destBuf.data();
+    size_t totalSamples = destBuf.size(); 
 
     // 2. Sequential loops using identical variables, casting, and structure from GenerateWAVMonoI
     // Processing Deletions Pass
@@ -903,15 +905,15 @@ std::vector<int32_t> AudioPlayerAL::ApplyToneDeltaMonoI(std::vector<int32_t> sam
             }
         }
     }
-
-    return sampleBuf;
 }
 
 
-std::vector<int32_t> AudioPlayerAL::ApplyToneDeltaMonoI_11(std::vector<int32_t> sampleBuf,
+void AudioPlayerAL::ApplyToneDeltaMonoI_11(std::vector<int32_t>& destBuf,
+                                      const std::vector<int32_t>& srcBuf,
                                       const std::vector<ToneTuple>& added,
                                       const std::vector<ToneTuple>& deleted) {
-    size_t currentSize = sampleBuf.size();
+    destBuf.assign(srcBuf.begin(), srcBuf.end());
+    size_t currentSize = destBuf.size();
     size_t requiredMaxEnd = currentSize;
 
     // 1. Scan added tones to determine the absolute maximum required sample boundary
@@ -950,12 +952,12 @@ std::vector<int32_t> AudioPlayerAL::ApplyToneDeltaMonoI_11(std::vector<int32_t> 
         // Updated safety buffer from 5 seconds * 44100 down to 5 seconds * 11025
         size_t safetyPadding = 5 * 11025; 
         size_t targetSamples = requiredMaxEnd + safetyPadding;
-        sampleBuf.resize(targetSamples, 0);
+        destBuf.resize(targetSamples, 0);
     }
 
     float globalVolume = m_volume * 0.01f;
-    int32_t* __restrict bufData = sampleBuf.data();
-    size_t totalSamples = sampleBuf.size(); 
+    int32_t* __restrict bufData = destBuf.data();
+    size_t totalSamples = destBuf.size(); 
 
     // 2. Processing Deletions Pass
     for (const auto& tone : deleted) {
@@ -1087,8 +1089,6 @@ std::vector<int32_t> AudioPlayerAL::ApplyToneDeltaMonoI_11(std::vector<int32_t> 
             }
         }
     }
-
-    return sampleBuf;
 }
 
 std::vector<float> AudioPlayerAL::GenerateWAVMono()
@@ -1375,20 +1375,27 @@ void AudioPlayerAL::ExportSamples()
 
 void AudioPlayerAL::Play()
 {
+    Stop();
     m_ABC_Play_Start = std::chrono::high_resolution_clock::now();
     m_ABC_Play_LastUpdate = m_ABC_Play_Start;
 
     trackpositions.resize(m_Nabctracks);
     std::fill( trackpositions.begin(), trackpositions.end(), 0 );
 
-    PlayThread = new std::thread(&AudioPlayerAL::PlayLoop, this);
     m_stop = 0;
-
+    PlayThread = new std::thread(&AudioPlayerAL::PlayLoop, this);
 }
 
 void AudioPlayerAL::Stop()
 {
    m_stop = 1;
+   if (PlayThread) {
+       if (PlayThread->joinable()) {
+           PlayThread->join();
+       }
+       delete PlayThread;
+       PlayThread = nullptr;
+   }
 }
 
 void AudioPlayerAL::Seek(float f)
@@ -1609,10 +1616,16 @@ void AudioPlayerAL::PlayLoop()
 
 AudioPlayerAL::~AudioPlayerAL()
 {
+    Stop();
+
     if (m_loadingThread && m_loadingThread->joinable()) {
         m_loadingThread->join();
     }
     delete m_loadingThread;
+    m_loadingThread = nullptr;
+
+    delete myabc;
+    myabc = nullptr;
 
     alDeleteSources(64, &sources[0]);
 	alDeleteBuffers(64, &buffers[0]);
