@@ -748,6 +748,18 @@ using FingerprintFrame = std::array<FFTBin, BINS_TO_KEEP>;
 
 
 
+// Reusable workspace configuration structure
+struct FingerprintWorkspace {
+    std::vector<float> inputMatrix;
+    std::vector<std::complex<float>> outputMatrix;
+
+    void reserve(size_t maxFrames, size_t fftSize) {
+        inputMatrix.reserve(maxFrames * fftSize);
+        outputMatrix.reserve(maxFrames * ((fftSize / 2) + 1));
+    }
+};
+
+
 std::vector<FingerprintFrame> FingerPrint(const std::vector<float>& targetSample)
 {
     const int FFT_SIZE = 1024;
@@ -863,130 +875,451 @@ std::vector<FingerprintFrame> FingerPrint_11(const std::vector<float>& targetSam
     return fp;
 }
 
-
+/*
 std::vector<FingerprintFrame> FingerPrintI(const std::vector<int32_t>& targetSample)
 {
     const int FFT_SIZE = 1024;
     const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1; 
 
-    std::vector<FingerprintFrame> fp;
-    if (targetSample.size() >= (size_t)FFT_SIZE)
-        fp.reserve(2 * targetSample.size() / FFT_SIZE);
+    size_t totalFrames = 0;
+    if (targetSample.size() >= (size_t)FFT_SIZE) {
+        totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
+    }
+
+    std::vector<FingerprintFrame> fp(totalFrames);
+    if (totalFrames == 0) return fp;
 
     static const pocketfft::shape_t  shape_in  { (size_t)FFT_SIZE };
     static const pocketfft::shape_t  axes      { 0 };
-    
     static const pocketfft::stride_t stride_in  { (ptrdiff_t)sizeof(float) };
     static const pocketfft::stride_t stride_out { (ptrdiff_t)sizeof(std::complex<float>) };
 
-    // Thread-local scratch buffers
-    static thread_local std::vector<float> in(FFT_SIZE);
-    static thread_local std::vector<std::complex<float>> out(R2C_OUT_SIZE);
-
-    // Reciprocal scale factor to bring int32 values back down to standard float range
     const float inverseScale = 1.0f / 32768.0f;
 
-    for (size_t i = 0; i + FFT_SIZE <= targetSample.size(); i += FFT_SIZE/2) {
-        
-        // 1. Vectorized Conversion & Windowing Loop
-        // Hint alignment and inform the compiler there is no pointer aliasing
-        const int32_t* __restrict src = &targetSample[i];
-        float* __restrict dest = in.data();
+    #pragma omp parallel
+    {
+        std::vector<float> in(FFT_SIZE);
+        std::vector<std::complex<float>> out(R2C_OUT_SIZE);
+
+        #pragma omp for schedule(static)
+        for (int64_t frameIdx = 0; frameIdx < static_cast<int64_t>(totalFrames); ++frameIdx) {
+            size_t i = frameIdx * (FFT_SIZE / 2);
+
+            const int32_t* __restrict src = &targetSample[i];
+            float* __restrict dest = in.data();
+            const float* __restrict win = &hann[0];
+
+            #pragma omp simd
+            for (int k = 0; k < FFT_SIZE; ++k) {
+                dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+            }
+
+            pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                           in.data(), out.data(), 1.0f);
+
+            FingerprintFrame frame;
+            const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
+            float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
+            const float* __restrict weight = &a_weighting[0];
+
+            #pragma omp simd
+            for (int k = 0; k < BINS_TO_KEEP; ++k) {
+                float real = out_raw[2 * k];
+                float imag = out_raw[2 * k + 1];
+                float mag = std::sqrt(real * real + imag * imag);
+                frame_raw[k] = mag * weight[k];
+            }
+
+            fp[frameIdx] = frame;
+        }
+    }
+    return fp;
+}*/
+
+
+std::vector<FingerprintFrame> FingerPrintI(
+    const std::vector<int32_t>& targetSample,
+    FingerprintWorkspace& workspace)
+{
+    const int FFT_SIZE = 1024;
+    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1; 
+
+    size_t totalFrames = 0;
+    if (targetSample.size() >= (size_t)FFT_SIZE) {
+        totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
+    }
+
+    std::vector<FingerprintFrame> fp(totalFrames);
+    if (totalFrames == 0) return fp;
+
+    // High-water mark resizing using persistent workspace vectors to eliminate heap allocation pauses
+    workspace.inputMatrix.resize(totalFrames * FFT_SIZE);
+    workspace.outputMatrix.resize(totalFrames * R2C_OUT_SIZE);
+
+    const float inverseScale = 1.0f / 32768.0f;
+
+    // Phase 1: Parallel Pre-processing (Windowing and Scaling) across rows
+    #pragma omp parallel for schedule(static)
+    for (int64_t frameIdx = 0; frameIdx < static_cast<int64_t>(totalFrames); ++frameIdx) {
+        size_t sampleOffset = frameIdx * (FFT_SIZE / 2);
+        size_t bufferOffset = frameIdx * FFT_SIZE;
+
+        const int32_t* __restrict src = &targetSample[sampleOffset];
+        float* __restrict dest = &workspace.inputMatrix[bufferOffset];
         const float* __restrict win = &hann[0];
-        
+
         #pragma omp simd
         for (int k = 0; k < FFT_SIZE; ++k) {
-            // Convert to float, apply inverse scale, and apply Hann windowing in one step
             dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
         }
+    }
 
-        // Execute FFT
-        pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
-                       in.data(), out.data(), 1.0f);
+    // Phase 2: Single Batched Multi-Dimensional FFT Execution
+    pocketfft::shape_t shape_in   { (size_t)totalFrames, (size_t)FFT_SIZE };
+    pocketfft::shape_t axes       { 1 }; // Perform row-by-row transforms along columns
+    
+    pocketfft::stride_t stride_in  { (ptrdiff_t)(FFT_SIZE * sizeof(float)), 
+                                     (ptrdiff_t)sizeof(float) };
+    pocketfft::stride_t stride_out { (ptrdiff_t)(R2C_OUT_SIZE * sizeof(std::complex<float>)), 
+                                     (ptrdiff_t)sizeof(std::complex<float>) };
 
-        FingerprintFrame frame;
+    // Hand over thread distribution to PocketFFT's native internal execution pool
+    size_t pocketfft_threads = omp_get_max_threads();
+
+    pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                   workspace.inputMatrix.data(), workspace.outputMatrix.data(), 1.0f, pocketfft_threads);
+
+    // Phase 3: Parallel Post-processing (Magnitude extraction directly into struct array elements)
+    #pragma omp parallel for schedule(static)
+    for (int64_t frameIdx = 0; frameIdx < static_cast<int64_t>(totalFrames); ++frameIdx) {
+        size_t bufferOffset = frameIdx * R2C_OUT_SIZE;
         
-        // 2. Vectorized Magnitude Loop
-        // Cast to raw float array to avoid std::complex layout tracking penalties
-        const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
-        float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
+        const std::complex<float>* __restrict out_frame = &workspace.outputMatrix[bufferOffset];
+        const float* __restrict weight = &a_weighting[0];
+        auto& current_frame = fp[frameIdx];
+
+        #pragma omp simd
+        for (int k = 0; k < BINS_TO_KEEP; ++k) {
+            float real = out_frame[k].real();
+            float imag = out_frame[k].imag();
+            float mag = std::sqrt(real * real + imag * imag);
+            current_frame[k].real = mag * weight[k];
+        }
+    }
+
+    return fp;
+}
+
+/*
+std::vector<FingerprintFrame> FingerPrintI_11(const std::vector<int32_t>& targetSample)
+{
+    const int FFT_SIZE = 256;
+    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1;
+
+    size_t totalFrames = 0;
+    if (targetSample.size() >= (size_t)FFT_SIZE) {
+        totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
+    }
+
+    std::vector<FingerprintFrame> fp(totalFrames);
+    if (totalFrames == 0) return fp;
+
+    static const pocketfft::shape_t  shape_in  { (size_t)FFT_SIZE };
+    static const pocketfft::shape_t  axes      { 0 };
+    static const pocketfft::stride_t stride_in  { (ptrdiff_t)sizeof(float) };
+    static const pocketfft::stride_t stride_out { (ptrdiff_t)sizeof(std::complex<float>) };
+
+    const float inverseScale = 1.0f / 32768.0f;
+
+    #pragma omp parallel
+    {
+        std::vector<float> in(FFT_SIZE);
+        std::vector<std::complex<float>> out(R2C_OUT_SIZE);
+
+        #pragma omp for schedule(static)
+        for (int64_t frameIdx = 0; frameIdx < static_cast<int64_t>(totalFrames); ++frameIdx) {
+            size_t i = frameIdx * (FFT_SIZE / 2);
+
+            const int32_t* __restrict src = &targetSample[i];
+            float* __restrict dest = in.data();
+            const float* __restrict win = &hann_11[0];
+
+            #pragma omp simd
+            for (int k = 0; k < FFT_SIZE; ++k) {
+                dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+            }
+
+            pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                           in.data(), out.data(), 1.0f);
+
+            FingerprintFrame frame;
+            const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
+            float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
+            const float* __restrict weight = &a_weighting[0];
+
+            #pragma omp simd
+            for (int k = 0; k < BINS_TO_KEEP; ++k) {
+                float real = out_raw[2 * k];
+                float imag = out_raw[2 * k + 1];
+                float mag = std::sqrt(real * real + imag * imag);
+                frame_raw[k] = mag * weight[k];
+            }
+
+            fp[frameIdx] = frame;
+        }
+    }
+    return fp;
+}*/
+
+std::vector<FingerprintFrame> FingerPrintI_11(
+    const std::vector<int32_t>& targetSample,
+    FingerprintWorkspace& workspace)
+{
+    const int FFT_SIZE = 256;
+    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1; 
+
+    size_t totalFrames = 0;
+    if (targetSample.size() >= (size_t)FFT_SIZE) {
+        totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
+    }
+
+    std::vector<FingerprintFrame> fp(totalFrames);
+    if (totalFrames == 0) return fp;
+
+    // Reclaim historical block allocation buffers
+    workspace.inputMatrix.resize(totalFrames * FFT_SIZE);
+    workspace.outputMatrix.resize(totalFrames * R2C_OUT_SIZE);
+
+    const float inverseScale = 1.0f / 32768.0f;
+
+    // Phase 1: Parallel Pre-processing (Windowing and Scaling)
+   // #pragma omp parallel for schedule(static)
+    for (int64_t frameIdx = 0; frameIdx < static_cast<int64_t>(totalFrames); ++frameIdx) {
+        size_t sampleOffset = frameIdx * (FFT_SIZE / 2);
+        size_t bufferOffset = frameIdx * FFT_SIZE;
+
+        const int32_t* __restrict src = &targetSample[sampleOffset];
+        float* __restrict dest = &workspace.inputMatrix[bufferOffset];
+        const float* __restrict win = &hann_11[0];
+
+        #pragma omp simd
+        for (int k = 0; k < FFT_SIZE; ++k) {
+            dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+        }
+    }
+
+    // Phase 2: Single Batched Multi-Dimensional FFT Execution
+    pocketfft::shape_t shape_in   { (size_t)totalFrames, (size_t)FFT_SIZE };
+    pocketfft::shape_t axes       { 1 }; 
+    
+    pocketfft::stride_t stride_in  { (ptrdiff_t)(FFT_SIZE * sizeof(float)), (ptrdiff_t)sizeof(float) };
+    pocketfft::stride_t stride_out { (ptrdiff_t)(R2C_OUT_SIZE * sizeof(std::complex<float>)), (ptrdiff_t)sizeof(std::complex<float>) };
+
+    // Leverage all execution cores for the mathematical transformation matrix pass
+    size_t pocketfft_threads = omp_get_max_threads();
+
+    pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                   workspace.inputMatrix.data(), workspace.outputMatrix.data(), 1.0f, pocketfft_threads);
+
+    // Phase 3: Parallel Post-processing (Magnitude Extraction)
+    #pragma omp parallel for schedule(static)
+    for (int64_t frameIdx = 0; frameIdx < static_cast<int64_t>(totalFrames); ++frameIdx) {
+        size_t bufferOffset = frameIdx * R2C_OUT_SIZE;
+        
+        const std::complex<float>* __restrict out_frame = &workspace.outputMatrix[bufferOffset];
+        const float* __restrict weight = &a_weighting[0];
+        auto& current_frame = fp[frameIdx];
+
+        #pragma omp simd
+        for (int k = 0; k < BINS_TO_KEEP; ++k) {
+            float real = out_frame[k].real();
+            float imag = out_frame[k].imag();
+            float mag = std::sqrt(real * real + imag * imag);
+            current_frame[k].real = mag * weight[k];
+        }
+    }
+
+    return fp;
+}
+
+/*
+std::vector<FingerprintFrame> FingerPrintPartialI(
+    const std::vector<int32_t>& targetSample,
+    const std::vector<FingerprintFrame>& currentFP,
+    size_t startFrame,
+    size_t endFrame)
+{
+    const int FFT_SIZE = 1024;
+    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1;
+
+    size_t totalFrames = 0;
+    if (targetSample.size() >= (size_t)FFT_SIZE) {
+        totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
+    }
+
+    std::vector<FingerprintFrame> fp = currentFP;
+    if (fp.size() != totalFrames) {
+        fp.resize(totalFrames);
+    }
+
+    // Clamp bounds against the total mathematically possible valid frames 
+    // This removes the need for inside-loop 'continue' size checks
+    startFrame = std::min(startFrame, totalFrames);
+    endFrame   = std::min(endFrame, totalFrames);
+    if (startFrame >= endFrame) return fp;
+
+    size_t numFramesToProcess = endFrame - startFrame;
+
+    // Allocate continuous multi-dimensional matrix blocks for the sliced range
+    std::vector<float> inputMatrix(numFramesToProcess * FFT_SIZE);
+    std::vector<std::complex<float>> outputMatrix(numFramesToProcess * R2C_OUT_SIZE);
+
+    const float inverseScale = 1.0f / 32768.0f;
+
+    // Phase 1: Sequential Pre-processing with SIMD vectorization over each frame
+    for (size_t i = 0; i < numFramesToProcess; ++i) {
+        size_t frameIdx = startFrame + i;
+        size_t sampleOffset = frameIdx * (FFT_SIZE / 2);
+        size_t bufferOffset = i * FFT_SIZE;
+
+        const int32_t* __restrict src = &targetSample[sampleOffset];
+        float* __restrict dest = &inputMatrix[bufferOffset];
+        const float* __restrict win = &hann[0];
+
+        #pragma omp simd
+        for (int k = 0; k < FFT_SIZE; ++k) {
+            dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+        }
+    }
+
+    // Phase 2: Single Batched Multi-Dimensional FFT Execution
+    pocketfft::shape_t shape_in   { (size_t)numFramesToProcess, (size_t)FFT_SIZE };
+    pocketfft::shape_t axes       { 1 }; // Transform along the columns (axis 1)
+    
+    pocketfft::stride_t stride_in  { (ptrdiff_t)(FFT_SIZE * sizeof(float)), 
+                                     (ptrdiff_t)sizeof(float) };
+    pocketfft::stride_t stride_out { (ptrdiff_t)(R2C_OUT_SIZE * sizeof(std::complex<float>)), 
+                                     (ptrdiff_t)sizeof(std::complex<float>) };
+
+    // Setting this to 1 keeps execution strictly single-threaded as requested,
+    // while still letting PocketFFT benefit from internal unrolled vector math lanes.
+    const size_t pocketfft_threads = 1;
+
+    pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                   inputMatrix.data(), outputMatrix.data(), 1.0f, pocketfft_threads);
+
+    // Phase 3: Post-processing (Magnitude & Weighting calculations) with SIMD
+    for (size_t i = 0; i < numFramesToProcess; ++i) {
+        size_t frameIdx = startFrame + i;
+        size_t bufferOffset = i * R2C_OUT_SIZE;
+        
+        const std::complex<float>* __restrict out_frame = &outputMatrix[bufferOffset];
+        float* __restrict frame_raw = reinterpret_cast<float*>(fp[frameIdx].data());
         const float* __restrict weight = &a_weighting[0];
 
         #pragma omp simd
         for (int k = 0; k < BINS_TO_KEEP; ++k) {
-            float real = out_raw[2 * k];
-            float imag = out_raw[2 * k + 1];
+            float real = out_frame[k].real();
+            float imag = out_frame[k].imag();
             float mag = std::sqrt(real * real + imag * imag);
             frame_raw[k] = mag * weight[k];
         }
-        
-        fp.push_back(frame);
     }
+
     return fp;
 }
 
-std::vector<FingerprintFrame> FingerPrintI_11(const std::vector<int32_t>& targetSample)
+*/
+
+std::vector<FingerprintFrame> FingerPrintPartialI(
+    const std::vector<int32_t>& targetSample,
+    const std::vector<FingerprintFrame>& currentFP,
+    size_t startFrame,
+    size_t endFrame,
+    FingerprintWorkspace& workspace)
 {
-    // 1. Updated Window and Bin Constraints
-    const int FFT_SIZE = 256;                        // Was 1024
-    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1;    // Now 129 (Max possible bins at 11kHz Nyquist)
+    const int FFT_SIZE = 1024;
+    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1;
 
-    std::vector<FingerprintFrame> fp;
-    if (targetSample.size() >= (size_t)FFT_SIZE)
-        fp.reserve(2 * targetSample.size() / FFT_SIZE);
+    size_t totalFrames = 0;
+    if (targetSample.size() >= (size_t)FFT_SIZE) {
+        totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
+    }
 
-    // 2. Updated PocketFFT shape geometries for 256 points
-    static const pocketfft::shape_t  shape_in  { (size_t)FFT_SIZE };
-    static const pocketfft::shape_t  axes      { 0 };
-    
-    static const pocketfft::stride_t stride_in  { (ptrdiff_t)sizeof(float) };
-    static const pocketfft::stride_t stride_out { (ptrdiff_t)sizeof(std::complex<float>) };
+    std::vector<FingerprintFrame> fp = currentFP;
+    if (fp.size() != totalFrames) {
+        fp.resize(totalFrames);
+    }
 
-    // Thread-local scratch buffers (automatically scales down memory allocation)
-    static thread_local std::vector<float> in(FFT_SIZE);
-    static thread_local std::vector<std::complex<float>> out(R2C_OUT_SIZE);
+    // Bounds safety clamping
+    startFrame = std::min(startFrame, totalFrames);
+    endFrame   = std::min(endFrame, totalFrames);
+    if (startFrame >= endFrame) return fp;
 
-    // Reciprocal scale factor remains unchanged
+    size_t numFramesToProcess = endFrame - startFrame;
+
+    // High-water mark resizing using persistent workspace vectors to eliminate heap jitter
+    workspace.inputMatrix.resize(numFramesToProcess * FFT_SIZE);
+    workspace.outputMatrix.resize(numFramesToProcess * R2C_OUT_SIZE);
+
     const float inverseScale = 1.0f / 32768.0f;
 
-    // 3. Loop step updates to FFT_SIZE/2 (128 sample hop size for 50% overlap)
-    for (size_t i = 0; i + FFT_SIZE <= targetSample.size(); i += FFT_SIZE/2) {
-        
-        // 1. Vectorized Conversion & Windowing Loop
-        const int32_t* __restrict src = &targetSample[i];
-        float* __restrict dest = in.data();
-        const float* __restrict win = &hann_11[0]; // Updated to your new table name
-        
+    // Phase 1: Pre-processing (Windowing and Scaling)
+    for (size_t i = 0; i < numFramesToProcess; ++i) {
+        size_t frameIdx = startFrame + i;
+        size_t sampleOffset = frameIdx * (FFT_SIZE / 2);
+        size_t bufferOffset = i * FFT_SIZE;
+
+        const int32_t* __restrict src = &targetSample[sampleOffset];
+        float* __restrict dest = &workspace.inputMatrix[bufferOffset];
+        const float* __restrict win = &hann[0];
+
         #pragma omp simd
         for (int k = 0; k < FFT_SIZE; ++k) {
-            // Convert to float, apply inverse scale, and apply Hann windowing in one step
             dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
         }
+    }
 
-        // Execute 256-point FFT
-        pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
-                       in.data(), out.data(), 1.0f);
+    // Phase 2: Single Batched Multi-Dimensional FFT Execution
+    pocketfft::shape_t shape_in   { (size_t)numFramesToProcess, (size_t)FFT_SIZE };
+    pocketfft::shape_t axes       { 1 }; // Perform row-by-row transforms along columns
+    
+    pocketfft::stride_t stride_in  { (ptrdiff_t)(FFT_SIZE * sizeof(float)), 
+                                     (ptrdiff_t)sizeof(float) };
+    pocketfft::stride_t stride_out { (ptrdiff_t)(R2C_OUT_SIZE * sizeof(std::complex<float>)), 
+                                     (ptrdiff_t)sizeof(std::complex<float>) };
 
-        FingerprintFrame frame;
+    const size_t pocketfft_threads = 1; // Explicit single-threaded math pass over matrix blocks
+
+    pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                   workspace.inputMatrix.data(), workspace.outputMatrix.data(), 1.0f, pocketfft_threads);
+
+    // Phase 3: Post-processing (Magnitude extraction directly into structure fields)
+    for (size_t i = 0; i < numFramesToProcess; ++i) {
+        size_t frameIdx = startFrame + i;
+        size_t bufferOffset = i * R2C_OUT_SIZE;
         
-        // 2. Vectorized Magnitude Loop
-        const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
-        float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
-        const float* __restrict weight = &a_weighting[0]; // Uses the exact same coefficients
+        const std::complex<float>* __restrict out_frame = &workspace.outputMatrix[bufferOffset];
+        const float* __restrict weight = &a_weighting[0];
+        
+        // Grab a reference to the active frame's std::array to avoid copying overhead
+        auto& current_frame = fp[frameIdx];
 
-        // Note: Ensure BINS_TO_KEEP is structurally capped at a maximum value of 129
         #pragma omp simd
         for (int k = 0; k < BINS_TO_KEEP; ++k) {
-            float real = out_raw[2 * k];
-            float imag = out_raw[2 * k + 1];
+            float real = out_frame[k].real();
+            float imag = out_frame[k].imag();
             float mag = std::sqrt(real * real + imag * imag);
-            frame_raw[k] = mag * weight[k];
+            
+            // Assign directly to the named structure field inside your array elements
+            current_frame[k].real = mag * weight[k];
         }
-        
-        fp.push_back(frame);
     }
+
     return fp;
 }
+
+/*
 
 std::vector<FingerprintFrame> FingerPrintPartialI(
     const std::vector<int32_t>& targetSample,
@@ -1009,72 +1342,153 @@ std::vector<FingerprintFrame> FingerPrintPartialI(
 
     startFrame = std::min(startFrame, fp.size());
     endFrame   = std::min(endFrame, fp.size());
+    if (startFrame >= endFrame) return fp;
 
     static const pocketfft::shape_t  shape_in  { (size_t)FFT_SIZE };
     static const pocketfft::shape_t  axes      { 0 };
     static const pocketfft::stride_t stride_in  { (ptrdiff_t)sizeof(float) };
     static const pocketfft::stride_t stride_out { (ptrdiff_t)sizeof(std::complex<float>) };
 
-    static thread_local std::vector<float> in(FFT_SIZE);
-    static thread_local std::vector<std::complex<float>> out(R2C_OUT_SIZE);
-
-    // Reciprocal scale factor to bring int32 values back down to standard float range
     const float inverseScale = 1.0f / 32768.0f;
 
-    for (size_t frameIdx = startFrame; frameIdx < endFrame; ++frameIdx) {
-        size_t i = frameIdx * (FFT_SIZE / 2);
-        if (i + FFT_SIZE > targetSample.size()) break;
+    //#pragma omp parallel
+    {
+        std::vector<float> in(FFT_SIZE);
+        std::vector<std::complex<float>> out(R2C_OUT_SIZE);
 
-        // 1. Vectorized Conversion & Windowing Loop
-        // Hint alignment and inform the compiler there is no pointer aliasing
-        const int32_t* __restrict src = &targetSample[i];
-        float* __restrict dest = in.data();
-        const float* __restrict win = &hann[0];
+        #pragma omp for schedule(static)
+        for (int64_t frameIdx = static_cast<int64_t>(startFrame); frameIdx < static_cast<int64_t>(endFrame); ++frameIdx) {
+            size_t i = frameIdx * (FFT_SIZE / 2);
+            if (i + FFT_SIZE > targetSample.size()) continue;
 
-        #pragma omp simd
-        for (int k = 0; k < FFT_SIZE; ++k) {
-            // Convert to float, apply inverse scale, and apply Hann windowing in one step
-            dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+            const int32_t* __restrict src = &targetSample[i];
+            float* __restrict dest = in.data();
+            const float* __restrict win = &hann[0];
+
+            #pragma omp simd
+            for (int k = 0; k < FFT_SIZE; ++k) {
+                dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+            }
+
+            pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                           in.data(), out.data(), 1.0f);
+
+            FingerprintFrame frame;
+            const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
+            float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
+            const float* __restrict weight = &a_weighting[0];
+
+            #pragma omp simd
+            for (int k = 0; k < BINS_TO_KEEP; ++k) {
+                float real = out_raw[2 * k];
+                float imag = out_raw[2 * k + 1];
+                float mag = std::sqrt(real * real + imag * imag);
+                frame_raw[k] = mag * weight[k];
+            }
+
+            fp[frameIdx] = frame;
         }
-
-        // Execute FFT
-        pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
-                       in.data(), out.data(), 1.0f);
-
-        FingerprintFrame frame;
-        
-        // 2. Vectorized Magnitude Loop
-        // Cast to raw float array to avoid std::complex layout tracking penalties
-        const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
-        float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
-        const float* __restrict weight = &a_weighting[0];
-
-        #pragma omp simd
-        for (int k = 0; k < BINS_TO_KEEP; ++k) {
-            float real = out_raw[2 * k];
-            float imag = out_raw[2 * k + 1];
-            float mag = std::sqrt(real * real + imag * imag);
-            frame_raw[k] = mag * weight[k];
-        }
-
-        fp[frameIdx] = frame;
     }
     return fp;
 }
+*/
 
+
+
+std::vector<FingerprintFrame> FingerPrintPartialI_11(
+    const std::vector<int32_t>& targetSample,
+    const std::vector<FingerprintFrame>& currentFP,
+    size_t startFrame,
+    size_t endFrame,
+    FingerprintWorkspace& workspace)
+{
+    const int FFT_SIZE = 256;
+    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1;
+
+    size_t totalFrames = 0;
+    if (targetSample.size() >= (size_t)FFT_SIZE) {
+        totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
+    }
+
+    std::vector<FingerprintFrame> fp = currentFP;
+    if (fp.size() != totalFrames) {
+        fp.resize(totalFrames);
+    }
+
+    // Secure operational safety bounds
+    startFrame = std::min(startFrame, totalFrames);
+    endFrame   = std::min(endFrame, totalFrames);
+    if (startFrame >= endFrame) return fp;
+
+    size_t numFramesToProcess = endFrame - startFrame;
+
+    // High-water mark resizing using persistent workspace vectors
+    workspace.inputMatrix.resize(numFramesToProcess * FFT_SIZE);
+    workspace.outputMatrix.resize(numFramesToProcess * R2C_OUT_SIZE);
+
+    const float inverseScale = 1.0f / 32768.0f;
+
+    // Phase 1: Windowing and Scaling Pre-processing
+    for (size_t i = 0; i < numFramesToProcess; ++i) {
+        size_t frameIdx = startFrame + i;
+        size_t sampleOffset = frameIdx * (FFT_SIZE / 2);
+        size_t bufferOffset = i * FFT_SIZE;
+
+        const int32_t* __restrict src = &targetSample[sampleOffset];
+        float* __restrict dest = &workspace.inputMatrix[bufferOffset];
+        const float* __restrict win = &hann_11[0];
+
+        #pragma omp simd
+        for (int k = 0; k < FFT_SIZE; ++k) {
+            dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+        }
+    }
+
+    // Phase 2: Single Batched Multi-Dimensional FFT Execution
+    pocketfft::shape_t shape_in   { (size_t)numFramesToProcess, (size_t)FFT_SIZE };
+    pocketfft::shape_t axes       { 1 }; // Perform row-by-row transforms along columns
+    
+    pocketfft::stride_t stride_in  { (ptrdiff_t)(FFT_SIZE * sizeof(float)), (ptrdiff_t)sizeof(float) };
+    pocketfft::stride_t stride_out { (ptrdiff_t)(R2C_OUT_SIZE * sizeof(std::complex<float>)), (ptrdiff_t)sizeof(std::complex<float>) };
+
+    const size_t pocketfft_threads = 1; // Strict single-threaded pass for isolation layout rules
+
+    pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                   workspace.inputMatrix.data(), workspace.outputMatrix.data(), 1.0f, pocketfft_threads);
+
+    // Phase 3: Magnitude extraction directly into structure array layouts
+    for (size_t i = 0; i < numFramesToProcess; ++i) {
+        size_t frameIdx = startFrame + i;
+        size_t bufferOffset = i * R2C_OUT_SIZE;
+        
+        const std::complex<float>* __restrict out_frame = &workspace.outputMatrix[bufferOffset];
+        const float* __restrict weight = &a_weighting[0];
+        auto& current_frame = fp[frameIdx];
+
+        #pragma omp simd
+        for (int k = 0; k < BINS_TO_KEEP; ++k) {
+            float real = out_frame[k].real();
+            float imag = out_frame[k].imag();
+            float mag = std::sqrt(real * real + imag * imag);
+            current_frame[k].real = mag * weight[k];
+        }
+    }
+
+    return fp;
+}
+
+/*
 std::vector<FingerprintFrame> FingerPrintPartialI_11(
     const std::vector<int32_t>& targetSample,
     const std::vector<FingerprintFrame>& currentFP,
     size_t startFrame,
     size_t endFrame)
 {
-    // 1. Updated Window and Bin Constraints
-    const int FFT_SIZE = 256;                        // Was 1024
-    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1;    // Now 129 (Max possible bins at 11kHz Nyquist)
+    const int FFT_SIZE = 256;
+    const int R2C_OUT_SIZE = (FFT_SIZE / 2) + 1;
 
     size_t totalFrames = 0;
     if (targetSample.size() >= (size_t)FFT_SIZE) {
-        // Correctly calculates frame count using a 128-sample hop size
         totalFrames = (targetSample.size() - FFT_SIZE) / (FFT_SIZE / 2) + 1;
     }
 
@@ -1085,60 +1499,55 @@ std::vector<FingerprintFrame> FingerPrintPartialI_11(
 
     startFrame = std::min(startFrame, fp.size());
     endFrame   = std::min(endFrame, fp.size());
+    if (startFrame >= endFrame) return fp;
 
-    // 2. Updated PocketFFT shape geometries for 256 points
     static const pocketfft::shape_t  shape_in  { (size_t)FFT_SIZE };
     static const pocketfft::shape_t  axes      { 0 };
     static const pocketfft::stride_t stride_in  { (ptrdiff_t)sizeof(float) };
     static const pocketfft::stride_t stride_out { (ptrdiff_t)sizeof(std::complex<float>) };
 
-    // Thread-local scratch buffers (automatically scales down memory allocation)
-    static thread_local std::vector<float> in(FFT_SIZE);
-    static thread_local std::vector<std::complex<float>> out(R2C_OUT_SIZE);
-
-    // Reciprocal scale factor remains unchanged
     const float inverseScale = 1.0f / 32768.0f;
 
-    for (size_t frameIdx = startFrame; frameIdx < endFrame; ++frameIdx) {
-        // Maps the index correctly using a 128-sample step (FFT_SIZE / 2)
-        size_t i = frameIdx * (FFT_SIZE / 2);
-        if (i + FFT_SIZE > targetSample.size()) break;
+    #pragma omp parallel
+    {
+        std::vector<float> in(FFT_SIZE);
+        std::vector<std::complex<float>> out(R2C_OUT_SIZE);
 
-        // 1. Vectorized Conversion & Windowing Loop
-        const int32_t* __restrict src = &targetSample[i];
-        float* __restrict dest = in.data();
-        const float* __restrict win = &hann_11[0]; // Updated to your 256-point table name
+        #pragma omp for schedule(static)
+        for (int64_t frameIdx = static_cast<int64_t>(startFrame); frameIdx < static_cast<int64_t>(endFrame); ++frameIdx) {
+            size_t i = frameIdx * (FFT_SIZE / 2);
+            if (i + FFT_SIZE > targetSample.size()) continue;
 
-        #pragma omp simd
-        for (int k = 0; k < FFT_SIZE; ++k) {
-            // Convert to float, apply inverse scale, and apply Hann windowing in one step
-            dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+            const int32_t* __restrict src = &targetSample[i];
+            float* __restrict dest = in.data();
+            const float* __restrict win = &hann_11[0];
+
+            #pragma omp simd
+            for (int k = 0; k < FFT_SIZE; ++k) {
+                dest[k] = (static_cast<float>(src[k]) * inverseScale) * win[k];
+            }
+
+            pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
+                           in.data(), out.data(), 1.0f);
+
+            FingerprintFrame frame;
+            const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
+            float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
+            const float* __restrict weight = &a_weighting[0];
+
+            #pragma omp simd
+            for (int k = 0; k < BINS_TO_KEEP; ++k) {
+                float real = out_raw[2 * k];
+                float imag = out_raw[2 * k + 1];
+                float mag = std::sqrt(real * real + imag * imag);
+                frame_raw[k] = mag * weight[k];
+            }
+
+            fp[frameIdx] = frame;
         }
-
-        // Execute 256-point FFT
-        pocketfft::r2c(shape_in, stride_in, stride_out, axes, pocketfft::FORWARD,
-                       in.data(), out.data(), 1.0f);
-
-        FingerprintFrame frame;
-        
-        // 2. Vectorized Magnitude Loop
-        const float* __restrict out_raw = reinterpret_cast<const float*>(out.data());
-        float* __restrict frame_raw = reinterpret_cast<float*>(frame.data());
-        const float* __restrict weight = &a_weighting[0]; // Uses the exact same coefficients
-
-        // Note: Ensure BINS_TO_KEEP does not exceed 129 to prevent vectorization out-of-bound faults
-        #pragma omp simd
-        for (int k = 0; k < BINS_TO_KEEP; ++k) {
-            float real = out_raw[2 * k];
-            float imag = out_raw[2 * k + 1];
-            float mag = std::sqrt(real * real + imag * imag);
-            frame_raw[k] = mag * weight[k];
-        }
-
-        fp[frameIdx] = frame;
     }
     return fp;
-}
+}*/
 
 bool ComputeToneDiffFrameRange(
     const std::vector<std::vector<ToneTuple>>& oldTuples,
@@ -1212,6 +1621,164 @@ bool ComputeToneDiffFrameRange(
 
 double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
                         const std::vector<FingerprintFrame>& f2,
+                        double* outC = nullptr,
+                        double fixedC = -1.0)
+{
+    size_t minFrames = std::min(f1.size(), f2.size());
+    size_t minElements = minFrames * BINS_TO_KEEP;
+
+    float c = 1.0f;
+    if (fixedC > 0.0) {
+        c = static_cast<float>(fixedC);
+    } else if (minFrames > 0) {
+        // Flattened Dot-Product Loop vectorized via SIMD
+        float f1sq = 0.0f;
+        float f1f2 = 0.0f;
+        
+        const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
+        const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
+
+        #pragma omp simd reduction(+:f1sq, f1f2)
+        for (int64_t i = 0; i < static_cast<int64_t>(minElements); ++i) {
+            float val1 = flat1[i];
+            float val2 = flat2[i];
+            f1sq += val1 * val1;
+            f1f2 += val1 * val2;
+        }
+
+        if (f1sq > 0.00001f) c = f1f2 / f1sq;
+    }
+
+    if (outC) *outC = c;
+
+    float sumSquares = 0.0f;
+
+    // Main Overlap Loop: Optimized algebraic expansion to cut sqrt operations in half
+    if (minFrames > 0) {
+        const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
+        const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
+
+        // Optimization: Precompute 2 * sqrt(c) outside the loop execution context
+        float twoSqrtC = 2.0f * std::sqrt(c);
+
+        // Mathematical expansion: (sqrt(a*c) - sqrt(b))^2 = a*c + b - 2*sqrt(c)*sqrt(a*b)
+        // This drops the number of expensive square root evaluations per loop from 2 down to 1.
+        #pragma omp simd reduction(+:sumSquares)
+        for (int64_t i = 0; i < static_cast<int64_t>(minElements); ++i) {
+            float val1 = flat1[i];
+            float val2 = flat2[i];
+            sumSquares += (val1 * c) + val2 - twoSqrtC * std::sqrt(val1 * val2);
+        }
+    }
+
+    // Remainder Loop for f1 (if f1 is longer than f2)
+    // Optimization: Eliminated completely redundant std::sqrt() invocations
+    if (f1.size() > minFrames) {
+        const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
+        size_t totalElementsF1 = f1.size() * BINS_TO_KEEP;
+        
+        #pragma omp simd reduction(+:sumSquares)
+        for (int64_t i = static_cast<int64_t>(minElements); i < static_cast<int64_t>(totalElementsF1); ++i) {
+            sumSquares += flat1[i] * c;
+        }
+    }
+
+    // Remainder Loop for f2 (if f2 is longer than f1)
+    // Optimization: Eliminated completely redundant std::sqrt() invocations
+    if (f2.size() > minFrames) {
+        const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
+        size_t totalElementsF2 = f2.size() * BINS_TO_KEEP;
+        
+        #pragma omp simd reduction(+:sumSquares)
+        for (int64_t i = static_cast<int64_t>(minElements); i < static_cast<int64_t>(totalElementsF2); ++i) {
+            sumSquares += flat2[i];
+        }
+    }
+
+    return std::sqrt(static_cast<double>(sumSquares));
+}
+
+/*
+double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
+                        const std::vector<FingerprintFrame>& f2,
+                        double* outC = nullptr,
+                        double fixedC = -1.0)
+{
+    size_t minFrames = std::min(f1.size(), f2.size());
+
+    // Total elements for the overlapping region
+    size_t minElements = minFrames * BINS_TO_KEEP;
+
+    float c = 1.0;
+    if (fixedC > 0.0) {
+        c = fixedC;
+    } else if (minFrames > 0) {
+        // Flattened Dot-Product Loop vectorized via SIMD
+        float f1sq = 0.0;
+        float f1f2 = 0.0;
+        
+        const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
+        const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
+
+        #pragma omp simd reduction(+:f1sq, f1f2)
+        for (int64_t i = 0; i < static_cast<int64_t>(minElements); ++i) {
+            float val1 = flat1[i];
+            float val2 = flat2[i];
+            f1sq += val1 * val1;
+            f1f2 += val1 * val2;
+        }
+
+        if (f1sq > 0.00001) c = f1f2 / f1sq;
+    }
+
+    if (outC) *outC = c;
+
+    float sumSquares = 0.0;
+
+    // Main Overlap Loop: Vectorized flat logic utilizing SIMD primitives
+    if (minFrames > 0) {
+        const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
+        const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
+
+        #pragma omp simd reduction(+:sumSquares)
+        for (int64_t i = 0; i < static_cast<int64_t>(minElements); ++i) {
+            float m1 = std::sqrt((float)flat1[i] * c);
+            float m2 = std::sqrt((float)flat2[i]);
+            float diff = m1 - m2;
+            sumSquares += diff * diff;
+        }
+    }
+
+    // Remainder Loop for f1 (if f1 is longer than f2)
+    if (f1.size() > minFrames) {
+        const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
+        size_t totalElementsF1 = f1.size() * BINS_TO_KEEP;
+        
+        #pragma omp simd reduction(+:sumSquares)
+        for (int64_t i = static_cast<int64_t>(minElements); i < static_cast<int64_t>(totalElementsF1); ++i) {
+            float m1 = std::sqrt((float)flat1[i] * c);
+            sumSquares += m1 * m1;
+        }
+    }
+
+    // Remainder Loop for f2 (if f2 is longer than f1)
+    if (f2.size() > minFrames) {
+        const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
+        size_t totalElementsF2 = f2.size() * BINS_TO_KEEP;
+        
+        #pragma omp simd reduction(+:sumSquares)
+        for (int64_t i = static_cast<int64_t>(minElements); i < static_cast<int64_t>(totalElementsF2); ++i) {
+            float m2 = std::sqrt((float)flat2[i]);
+            sumSquares += m2 * m2;
+        }
+    }
+
+    return std::sqrt(sumSquares);
+}*/
+
+/*
+double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
+                        const std::vector<FingerprintFrame>& f2,
                         std::vector<double>* outFrameErrors = nullptr,
                         double* outC = nullptr,
                         double fixedC = -1.0)
@@ -1234,16 +1801,14 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
         const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
         const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
 
-        
-        #pragma omp simd reduction(+:f1sq, f1f2)
-        for (size_t i = 0; i < minElements; ++i) {
+        #pragma omp parallel for reduction(+:f1sq, f1f2) schedule(static)
+        for (int64_t i = 0; i < static_cast<int64_t>(minElements); ++i) {
             float val1 = flat1[i];
             float val2 = flat2[i];
             f1sq += val1 * val1;
             f1f2 += val1 * val2;
         }
 
-        
         if (f1sq > 0.00001) c = f1f2 / f1sq;
     }
 
@@ -1257,11 +1822,10 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
         const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
 
         if (outFrameErrors) {
-            // If the user needs per-frame errors, we keep a nested structure 
-            // but the compiler can unroll inner loops easily since BINS_TO_KEEP is constant
-            for (size_t i = 0; i < minFrames; ++i) {
+            #pragma omp parallel for reduction(+:sumSquares) schedule(static)
+            for (int64_t i = 0; i < static_cast<int64_t>(minFrames); ++i) {
                 float frameSum = 0.0;
-                size_t offset = i * BINS_TO_KEEP;
+                size_t offset = static_cast<size_t>(i) * BINS_TO_KEEP;
                 
                 #pragma omp simd reduction(+:frameSum)
                 for (size_t j = 0; j < BINS_TO_KEEP; ++j) {
@@ -1274,10 +1838,8 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
                 (*outFrameErrors)[i] = frameSum;
             }
         } else {
-            // Purely flat single loop when outFrameErrors is null (maximum vectorization)
-            
-            #pragma omp simd reduction(+:sumSquares)
-            for (size_t i = 0; i < minElements; ++i) {
+            #pragma omp parallel for reduction(+:sumSquares) schedule(static)
+            for (int64_t i = 0; i < static_cast<int64_t>(minElements); ++i) {
                 float m1 = std::sqrt((float)flat1[i] * c);
                 float m2 = std::sqrt((float)flat2[i]);
                 float diff = m1 - m2;
@@ -1291,12 +1853,12 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
         const float* __restrict flat1 = reinterpret_cast<const float*>(f1[0].data());
         
         if (outFrameErrors) {
-            for (size_t i = minFrames; i < f1.size(); ++i) {
+            #pragma omp parallel for reduction(+:sumSquares) schedule(static)
+            for (int64_t i = static_cast<int64_t>(minFrames); i < static_cast<int64_t>(f1.size()); ++i) {
                 float frameSum = 0.0;
-                size_t offset = i * BINS_TO_KEEP;
+                size_t offset = static_cast<size_t>(i) * BINS_TO_KEEP;
                 #pragma omp simd reduction(+:frameSum)
                 for (size_t j = 0; j < BINS_TO_KEEP; ++j) {
-                    // Note: sqrt(x * c) * sqrt(x * c) simplifies to just (x * c) if inputs are non-negative
                     float m1 = std::sqrt((float)flat1[offset + j] * c);
                     frameSum += m1 * m1;
                 }
@@ -1305,8 +1867,8 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
             }
         } else {
             size_t totalElementsF1 = f1.size() * BINS_TO_KEEP;
-            #pragma omp simd reduction(+:sumSquares)
-            for (size_t i = minElements; i < totalElementsF1; ++i) {
+            #pragma omp parallel for reduction(+:sumSquares) schedule(static)
+            for (int64_t i = static_cast<int64_t>(minElements); i < static_cast<int64_t>(totalElementsF1); ++i) {
                 float m1 = std::sqrt((float)flat1[i] * c);
                 sumSquares += m1 * m1;
             }
@@ -1318,9 +1880,10 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
         const float* __restrict flat2 = reinterpret_cast<const float*>(f2[0].data());
         
         if (outFrameErrors) {
-            for (size_t i = minFrames; i < f2.size(); ++i) {
+            #pragma omp parallel for reduction(+:sumSquares) schedule(static)
+            for (int64_t i = static_cast<int64_t>(minFrames); i < static_cast<int64_t>(f2.size()); ++i) {
                 float frameSum = 0.0;
-                size_t offset = i * BINS_TO_KEEP;
+                size_t offset = static_cast<size_t>(i) * BINS_TO_KEEP;
                 #pragma omp simd reduction(+:frameSum)
                 for (size_t j = 0; j < BINS_TO_KEEP; ++j) {
                     float m2 = std::sqrt((float)flat2[offset + j]);
@@ -1331,8 +1894,8 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
             }
         } else {
             size_t totalElementsF2 = f2.size() * BINS_TO_KEEP;
-            #pragma omp simd reduction(+:sumSquares)
-            for (size_t i = minElements; i < totalElementsF2; ++i) {
+            #pragma omp parallel for reduction(+:sumSquares) schedule(static)
+            for (int64_t i = static_cast<int64_t>(minElements); i < static_cast<int64_t>(totalElementsF2); ++i) {
                 float m2 = std::sqrt((float)flat2[i]);
                 sumSquares += m2 * m2;
             }
@@ -1340,7 +1903,7 @@ double FingerPrintMatch(const std::vector<FingerprintFrame>& f1,
     }
 
     return std::sqrt(sumSquares);
-}
+}*/
 
 // Generate the ABC text for a ToneList without rendering audio.
 // This is cheap compared to the full audio render + FFT pipeline.
@@ -1779,6 +2342,9 @@ struct AppState {
     int    sweepGhostMult      = 5;     // ghost area  = sweepGhostMult  * 2048 samples
     int    sweepStepsPerWindow = 10000; // SA steps per window position
 
+    // --- OpenMP config ---
+    int    numEngineThreads    = 4;     // OpenMP thread count (1 .. 16)
+
     // --- Sweeping mode runtime state (written by worker, read by GUI) ---
     int    sweepCurrentWindow  = 0;
     int    sweepTotalWindows   = 0;
@@ -1789,11 +2355,15 @@ struct AppState {
 // ---------------------------------------------------------------------------
 void runMatcher(AppState* s)
 {
+    omp_set_num_threads(s->numEngineThreads);
     std::mt19937 gen(815);
 
     // Build initial ToneList from GUI settings.
     // Track 0 is always the dummy/empty track; real tracks start at index 1.
     ToneList currentList;
+
+    // Workspace for FFT
+    FingerprintWorkspace workspace;
     
 
     // If a tonelist was already pre-loaded (via drag), use it; otherwise build fresh
@@ -1836,11 +2406,13 @@ void runMatcher(AppState* s)
     std::vector<std::vector<ToneTuple>> currentTuple = ToneListToToneTuples(currentList);
     s->player->SendToneTuples(currentTuple);
 
-    std::vector<int32_t> currentAudioI = s->player->GenerateWAVMonoI_11();
+    std::vector<int32_t> currentAudioI;
+    std::vector<int32_t> canAudioI;
+    s->player->GenerateWAVMonoI_11(currentAudioI);
     size_t initialPadding = (currentAudioI.size() + 512) % 512;
     for (size_t p = 0; p < initialPadding; p++) currentAudioI.push_back(0);
 
-    std::vector<FingerprintFrame> fp = FingerPrintI_11(currentAudioI); 
+    std::vector<FingerprintFrame> fp = FingerPrintI_11(currentAudioI, workspace); 
 
     double currentScore = FingerPrintMatch(fp, targetFP);
 
@@ -1944,20 +2516,20 @@ void runMatcher(AppState* s)
 
             if (( addedTones.size() < 2 ) &&( deletedTones.size() < 2))
             {
-                canAudioI = s->player->ApplyToneDeltaMonoI_11(currentAudioI, addedTones, deletedTones);
+                s->player->ApplyToneDeltaMonoI_11(canAudioI, currentAudioI, addedTones, deletedTones);
             } else
             {
                 s->player->SendToneTuples(canTuple);
-                canAudioI = s->player->GenerateWAVMonoI_11();
+                s->player->GenerateWAVMonoI_11(canAudioI);
                 size_t pad = (canAudioI.size() + 512) % 512;
-                 for (size_t p = 0; p < pad; p++) canAudioI.push_back(0);                
+                for (size_t p = 0; p < pad; p++) canAudioI.push_back(0);                
             }
 
             if (usePartialFP) {
-                candFP = FingerPrintPartialI_11(canAudioI, currentFP, startFrame, endFrame);
+                candFP = FingerPrintPartialI_11(canAudioI, currentFP, startFrame, endFrame, workspace);
 
             } else {
-                candFP = FingerPrintI_11(canAudioI);
+                candFP = FingerPrintI_11(canAudioI, workspace);
             }
 
             chrono_after = std::chrono::high_resolution_clock::now();
@@ -1978,11 +2550,12 @@ void runMatcher(AppState* s)
         if (isNewBest) {
             // Generate clean full audio & fingerprint for global best to eliminate any roundoff error and verify true score
             s->player->SendToneTuples(canTuple);
-            std::vector<int32_t> cleanBestAudioI = s->player->GenerateWAVMonoI_11();
+            std::vector<int32_t> cleanBestAudioI;
+            s->player->GenerateWAVMonoI_11(cleanBestAudioI);
             size_t pad = (cleanBestAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) cleanBestAudioI.push_back(0);
 
-            std::vector<FingerprintFrame> testFP = FingerPrintI_11(cleanBestAudioI);
+            std::vector<FingerprintFrame> testFP = FingerPrintI_11(cleanBestAudioI, workspace);
             double cleanScore = FingerPrintMatch(testFP, targetFP);
 
             if (cleanScore < bestScore) {
@@ -2012,17 +2585,17 @@ void runMatcher(AppState* s)
             currentFP    = std::move(candFP);
             currentTuple = canTuple;
             if (!canAudioI.empty()) {
-                currentAudioI = std::move(canAudioI);
+                currentAudioI.assign(canAudioI.begin(), canAudioI.end());
             }
 
             // Periodic re-sync of SA walk state to prevent accumulation of floating point roundoff errors
              if (acceptedSinceResync >= 1000) {
                s->player->SendToneTuples(currentTuple);
-               currentAudioI = s->player->GenerateWAVMonoI_11();
+               s->player->GenerateWAVMonoI_11(currentAudioI);
                size_t pad = (currentAudioI.size() + 512) % 512;
                for (size_t p = 0; p < pad; p++) currentAudioI.push_back(0);
 
-               currentFP = FingerPrintI_11(currentAudioI);
+               currentFP = FingerPrintI_11(currentAudioI, workspace);
                currentScore = FingerPrintMatch(currentFP, targetFP);
                acceptedSinceResync = 0;
             }
@@ -2098,11 +2671,15 @@ void runMatcher(AppState* s)
 // ---------------------------------------------------------------------------
 void runMatcher_44(AppState* s)
 {
+    omp_set_num_threads(s->numEngineThreads);
     std::mt19937 gen(815);
 
     // Build initial ToneList from GUI settings.
     // Track 0 is always the dummy/empty track; real tracks start at index 1.
     ToneList currentList;
+
+    // Workspace for FFT
+    FingerprintWorkspace workspace;
     
 
     // If a tonelist was already pre-loaded (via drag), use it; otherwise build fresh
@@ -2145,11 +2722,13 @@ void runMatcher_44(AppState* s)
     std::vector<std::vector<ToneTuple>> currentTuple = ToneListToToneTuples(currentList);
     s->player->SendToneTuples(currentTuple);
 
-    std::vector<int32_t> currentAudioI = s->player->GenerateWAVMonoI();
+    std::vector<int32_t> currentAudioI;
+    std::vector<int32_t> canAudioI;
+    s->player->GenerateWAVMonoI(currentAudioI);
     size_t initialPadding = (currentAudioI.size() + 512) % 512;
     for (size_t p = 0; p < initialPadding; p++) currentAudioI.push_back(0);
 
-    std::vector<FingerprintFrame> fp = FingerPrintI(currentAudioI); 
+    std::vector<FingerprintFrame> fp = FingerPrintI(currentAudioI, workspace); 
 
     double currentScore = FingerPrintMatch(fp, targetFP);
 
@@ -2259,20 +2838,20 @@ void runMatcher_44(AppState* s)
 
             if (( addedTones.size() < 2 ) &&( deletedTones.size() < 2))
             {
-                canAudioI = s->player->ApplyToneDeltaMonoI(currentAudioI, addedTones, deletedTones);
+                s->player->ApplyToneDeltaMonoI(canAudioI, currentAudioI, addedTones, deletedTones);
             } else
             {
                 s->player->SendToneTuples(canTuple);
-                canAudioI = s->player->GenerateWAVMonoI();
+                s->player->GenerateWAVMonoI(canAudioI);
                 size_t pad = (canAudioI.size() + 512) % 512;
                  for (size_t p = 0; p < pad; p++) canAudioI.push_back(0);                
             }
 
             if (usePartialFP) {
-                candFP = FingerPrintPartialI(canAudioI, currentFP, startFrame, endFrame);
+                candFP = FingerPrintPartialI(canAudioI, currentFP, startFrame, endFrame, workspace);
 
             } else {
-                candFP = FingerPrintI(canAudioI);
+                candFP = FingerPrintI(canAudioI, workspace);
             }
 
             chrono_after = std::chrono::high_resolution_clock::now();
@@ -2294,11 +2873,12 @@ void runMatcher_44(AppState* s)
         if (isNewBest) {
             // Generate clean full audio & fingerprint for global best to eliminate any roundoff error and verify true score
             s->player->SendToneTuples(canTuple);
-            std::vector<int32_t> cleanBestAudioI = s->player->GenerateWAVMonoI();
+            std::vector<int32_t> cleanBestAudioI;
+            s->player->GenerateWAVMonoI(cleanBestAudioI);
             size_t pad = (cleanBestAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) cleanBestAudioI.push_back(0);
 
-            std::vector<FingerprintFrame> testFP = FingerPrintI(cleanBestAudioI);
+            std::vector<FingerprintFrame> testFP = FingerPrintI(cleanBestAudioI, workspace);
             double cleanScore = FingerPrintMatch(testFP, targetFP);
 
             if (cleanScore < bestScore) {
@@ -2332,17 +2912,17 @@ void runMatcher_44(AppState* s)
             currentFP    = std::move(candFP);
             currentTuple = canTuple;
             if (!canAudioI.empty()) {
-                currentAudioI = std::move(canAudioI);
+                currentAudioI.assign(canAudioI.begin(), canAudioI.end());
             }
 
             // Periodic re-sync of SA walk state to prevent accumulation of floating point roundoff errors
              if (acceptedSinceResync >= 1000) {
                s->player->SendToneTuples(currentTuple);
-               currentAudioI = s->player->GenerateWAVMonoI();
+               s->player->GenerateWAVMonoI(currentAudioI);
                size_t pad = (currentAudioI.size() + 512) % 512;
                for (size_t p = 0; p < pad; p++) currentAudioI.push_back(0);
 
-               currentFP = FingerPrintI(currentAudioI);
+               currentFP = FingerPrintI(currentAudioI, workspace);
                currentScore = FingerPrintMatch(currentFP, targetFP);
                acceptedSinceResync = 0;
             }
@@ -2428,6 +3008,7 @@ void runMatcher_44(AppState* s)
 // ---------------------------------------------------------------------------
 void runMatcherSweep(AppState* s)
 {
+    omp_set_num_threads(s->numEngineThreads);
     std::mt19937 gen(815);
 
     // Read sweeping config under lock, then release
@@ -2439,6 +3020,9 @@ void runMatcherSweep(AppState* s)
         ghostSizeSamples  = (uint64_t)s->sweepGhostMult  * 2048;
         stepsPerWindow    = s->sweepStepsPerWindow;
     }
+
+    // Workspace for FFT
+    FingerprintWorkspace workspace;
 
 
     for (int mumu = 1; !s->stopRequested; ++mumu) {
@@ -2508,13 +3092,14 @@ void runMatcherSweep(AppState* s)
     if (totalToneCount > 0) {
         std::vector<std::vector<ToneTuple>> fullTuples = ToneListToToneTuples(fullList);
         s->player->SendToneTuples(fullTuples);
-        std::vector<int32_t> fullAudioI = s->player->GenerateWAVMonoI_11();
+        std::vector<int32_t> fullAudioI;
+        s->player->GenerateWAVMonoI_11(fullAudioI);
         {
             size_t pad = (fullAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) fullAudioI.push_back(0);
         }
-        std::vector<FingerprintFrame> fullFP = FingerPrintI_11(fullAudioI);
-        FingerPrintMatch(fullFP, targetFP, nullptr, &predeterminedC);
+        std::vector<FingerprintFrame> fullFP = FingerPrintI_11(fullAudioI, workspace);
+        FingerPrintMatch(fullFP, targetFP, &predeterminedC);
     }
 
     for (int wIdx = 0; wIdx < totalWindows && !s->stopRequested; ++wIdx) {
@@ -2558,18 +3143,20 @@ void runMatcherSweep(AppState* s)
                 targetFP.begin() + (ptrdiff_t)fpCenterStart,
                 targetFP.begin() + (ptrdiff_t)(fpCenterStart + actualMatchFrames));
 
-            return FingerPrintMatch(matchedCandFP, matchedTargetFP, nullptr, nullptr, predeterminedC);
+            return FingerPrintMatch(matchedCandFP, matchedTargetFP, nullptr, predeterminedC);
         };
 
         // --- Initial render of the full capture zone (ghost-area | center window | ghost-area) ---
         std::vector<std::vector<ToneTuple>> currentTuple = ToneListToToneTuples(windowList);
         s->player->SendToneTuples(currentTuple);
-        std::vector<int32_t> currentAudioI = s->player->GenerateWAVMonoI_11();
+        std::vector<int32_t> currentAudioI;
+        std::vector<int32_t> canAudioI;
+        s->player->GenerateWAVMonoI_11(currentAudioI);
         {
             size_t pad = (currentAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) currentAudioI.push_back(0);
         }
-        std::vector<FingerprintFrame> currentFP    = FingerPrintI_11(currentAudioI);
+        std::vector<FingerprintFrame> currentFP    = FingerPrintI_11(currentAudioI, workspace);
         double                        currentScore  = computeWindowScore(currentFP);
 
         ToneList bestWindowList  = windowList;
@@ -2615,19 +3202,19 @@ void runMatcherSweep(AppState* s)
                     currentFP.size(), startFrame, endFrame, addedTones, deletedTones);
 
                 if ((addedTones.size() < 2) && (deletedTones.size() < 2)) {
-                    canAudioI = s->player->ApplyToneDeltaMonoI_11(
-                        currentAudioI, addedTones, deletedTones);
+                    s->player->ApplyToneDeltaMonoI_11(
+                        canAudioI, currentAudioI, addedTones, deletedTones);
                 } else {
                     s->player->SendToneTuples(canTuple);
-                    canAudioI = s->player->GenerateWAVMonoI_11();
+                    s->player->GenerateWAVMonoI_11(canAudioI);
                     size_t pad = (canAudioI.size() + 512) % 512;
                     for (size_t p = 0; p < pad; p++) canAudioI.push_back(0);
                 }
 
                 if (usePartialFP) {
-                    candFP = FingerPrintPartialI_11(canAudioI, currentFP, startFrame, endFrame);
+                    candFP = FingerPrintPartialI_11(canAudioI, currentFP, startFrame, endFrame, workspace);
                 } else {
-                    candFP = FingerPrintI_11(canAudioI);
+                    candFP = FingerPrintI_11(canAudioI, workspace);
                 }
                 candScore = computeWindowScore(candFP);
             }
@@ -2635,12 +3222,13 @@ void runMatcherSweep(AppState* s)
             // Update local window best (with clean-render verification)
             if (candScore < bestWindowScore) {
                 s->player->SendToneTuples(canTuple);
-                std::vector<int32_t> cleanAudioI = s->player->GenerateWAVMonoI_11();
+                std::vector<int32_t> cleanAudioI;
+                s->player->GenerateWAVMonoI_11(cleanAudioI);
                 {
                     size_t pad = (cleanAudioI.size() + 512) % 512;
                     for (size_t p = 0; p < pad; p++) cleanAudioI.push_back(0);
                 }
-                std::vector<FingerprintFrame> testFP     = FingerPrintI_11(cleanAudioI);
+                std::vector<FingerprintFrame> testFP     = FingerPrintI_11(cleanAudioI, workspace);
                 double                        cleanScore  = computeWindowScore(testFP);
                 if (cleanScore < bestWindowScore) {
                     bestWindowScore = cleanScore;
@@ -2660,17 +3248,17 @@ void runMatcherSweep(AppState* s)
                 currentFP    = std::move(candFP);
                 currentTuple = canTuple;
                 if (!canAudioI.empty())
-                    currentAudioI = std::move(canAudioI);
+                    currentAudioI.assign(canAudioI.begin(), canAudioI.end());
 
                 // Periodic resync to prevent floating-point drift
                 if (acceptedSinceResync >= 1000) {
                     s->player->SendToneTuples(currentTuple);
-                    currentAudioI = s->player->GenerateWAVMonoI_11();
+                    s->player->GenerateWAVMonoI_11(currentAudioI);
                     {
                         size_t pad = (currentAudioI.size() + 512) % 512;
                         for (size_t p = 0; p < pad; p++) currentAudioI.push_back(0);
                     }
-                    currentFP    = FingerPrintI_11(currentAudioI);
+                    currentFP    = FingerPrintI_11(currentAudioI, workspace);
                     currentScore = computeWindowScore(currentFP);
                     acceptedSinceResync = 0;
                 }
@@ -2715,12 +3303,13 @@ void runMatcherSweep(AppState* s)
     if (!s->stopRequested) {
         std::vector<std::vector<ToneTuple>> finalTuples = ToneListToToneTuples(fullList);
         s->player->SendToneTuples(finalTuples);
-        std::vector<int32_t> finalAudioI = s->player->GenerateWAVMonoI_11();
+        std::vector<int32_t> finalAudioI;
+        s->player->GenerateWAVMonoI_11(finalAudioI);
         {
             size_t pad = (finalAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) finalAudioI.push_back(0);
         }
-        std::vector<FingerprintFrame> finalFP    = FingerPrintI_11(finalAudioI);
+        std::vector<FingerprintFrame> finalFP    = FingerPrintI_11(finalAudioI, workspace);
         double                        finalScore  = FingerPrintMatch(finalFP, targetFP);
 
         std::lock_guard<std::mutex> lk(s->mtx);
@@ -2741,6 +3330,7 @@ void runMatcherSweep(AppState* s)
 // ---------------------------------------------------------------------------
 void runMatcherSweep_44(AppState* s)
 {
+    omp_set_num_threads(s->numEngineThreads);
     std::mt19937 gen(815);
 
     // Read sweeping config under lock, then release
@@ -2753,6 +3343,9 @@ void runMatcherSweep_44(AppState* s)
         stepsPerWindow    = s->sweepStepsPerWindow;
     }
 
+        FingerprintWorkspace workspace;
+
+    
 
     for (int mumu = 1; !s->stopRequested; ++mumu) {
     // Each sweep step moves the window right by half its size (multiple of 1024)
@@ -2821,13 +3414,14 @@ void runMatcherSweep_44(AppState* s)
     if (totalToneCount > 0) {
         std::vector<std::vector<ToneTuple>> fullTuples = ToneListToToneTuples(fullList);
         s->player->SendToneTuples(fullTuples);
-        std::vector<int32_t> fullAudioI = s->player->GenerateWAVMonoI();
+        std::vector<int32_t> fullAudioI;
+        s->player->GenerateWAVMonoI(fullAudioI);
         {
             size_t pad = (fullAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) fullAudioI.push_back(0);
         }
-        std::vector<FingerprintFrame> fullFP = FingerPrintI(fullAudioI);
-        FingerPrintMatch(fullFP, targetFP, nullptr, &predeterminedC);
+        std::vector<FingerprintFrame> fullFP = FingerPrintI(fullAudioI, workspace);
+        FingerPrintMatch(fullFP, targetFP, &predeterminedC);
     }
 
     for (int wIdx = 0; wIdx < totalWindows && !s->stopRequested; ++wIdx) {
@@ -2871,18 +3465,20 @@ void runMatcherSweep_44(AppState* s)
                 targetFP.begin() + (ptrdiff_t)fpCenterStart,
                 targetFP.begin() + (ptrdiff_t)(fpCenterStart + actualMatchFrames));
 
-            return FingerPrintMatch(matchedCandFP, matchedTargetFP, nullptr, nullptr, predeterminedC);
+            return FingerPrintMatch(matchedCandFP, matchedTargetFP, nullptr, predeterminedC);
         };
 
         // --- Initial render of the full capture zone (ghost-area | center window | ghost-area) ---
         std::vector<std::vector<ToneTuple>> currentTuple = ToneListToToneTuples(windowList);
         s->player->SendToneTuples(currentTuple);
-        std::vector<int32_t> currentAudioI = s->player->GenerateWAVMonoI();
+        std::vector<int32_t> currentAudioI;
+        std::vector<int32_t> canAudioI;
+        s->player->GenerateWAVMonoI(currentAudioI);
         {
             size_t pad = (currentAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) currentAudioI.push_back(0);
         }
-        std::vector<FingerprintFrame> currentFP    = FingerPrintI(currentAudioI);
+        std::vector<FingerprintFrame> currentFP    = FingerPrintI(currentAudioI, workspace);
         double                        currentScore  = computeWindowScore(currentFP);
 
         ToneList bestWindowList  = windowList;
@@ -2928,19 +3524,19 @@ void runMatcherSweep_44(AppState* s)
                     currentFP.size(), startFrame, endFrame, addedTones, deletedTones);
 
                 if ((addedTones.size() < 2) && (deletedTones.size() < 2)) {
-                    canAudioI = s->player->ApplyToneDeltaMonoI(
-                        currentAudioI, addedTones, deletedTones);
+                    s->player->ApplyToneDeltaMonoI(
+                        canAudioI, currentAudioI, addedTones, deletedTones);
                 } else {
                     s->player->SendToneTuples(canTuple);
-                    canAudioI = s->player->GenerateWAVMonoI();
+                    s->player->GenerateWAVMonoI(canAudioI);
                     size_t pad = (canAudioI.size() + 512) % 512;
                     for (size_t p = 0; p < pad; p++) canAudioI.push_back(0);
                 }
 
                 if (usePartialFP) {
-                    candFP = FingerPrintPartialI(canAudioI, currentFP, startFrame, endFrame);
+                    candFP = FingerPrintPartialI(canAudioI, currentFP, startFrame, endFrame, workspace);
                 } else {
-                    candFP = FingerPrintI(canAudioI);
+                    candFP = FingerPrintI(canAudioI, workspace);
                 }
                 candScore = computeWindowScore(candFP);
             }
@@ -2948,12 +3544,13 @@ void runMatcherSweep_44(AppState* s)
             // Update local window best (with clean-render verification)
             if (candScore < bestWindowScore) {
                 s->player->SendToneTuples(canTuple);
-                std::vector<int32_t> cleanAudioI = s->player->GenerateWAVMonoI();
+                std::vector<int32_t> cleanAudioI;
+                s->player->GenerateWAVMonoI(cleanAudioI);
                 {
                     size_t pad = (cleanAudioI.size() + 512) % 512;
                     for (size_t p = 0; p < pad; p++) cleanAudioI.push_back(0);
                 }
-                std::vector<FingerprintFrame> testFP     = FingerPrintI(cleanAudioI);
+                std::vector<FingerprintFrame> testFP     = FingerPrintI(cleanAudioI, workspace);
                 double                        cleanScore  = computeWindowScore(testFP);
                 if (cleanScore < bestWindowScore) {
                     bestWindowScore = cleanScore;
@@ -2973,17 +3570,17 @@ void runMatcherSweep_44(AppState* s)
                 currentFP    = std::move(candFP);
                 currentTuple = canTuple;
                 if (!canAudioI.empty())
-                    currentAudioI = std::move(canAudioI);
+                    currentAudioI.assign(canAudioI.begin(), canAudioI.end());
 
                 // Periodic resync to prevent floating-point drift
                 if (acceptedSinceResync >= 1000) {
                     s->player->SendToneTuples(currentTuple);
-                    currentAudioI = s->player->GenerateWAVMonoI();
+                    s->player->GenerateWAVMonoI(currentAudioI);
                     {
                         size_t pad = (currentAudioI.size() + 512) % 512;
                         for (size_t p = 0; p < pad; p++) currentAudioI.push_back(0);
                     }
-                    currentFP    = FingerPrintI(currentAudioI);
+                    currentFP    = FingerPrintI(currentAudioI, workspace);
                     currentScore = computeWindowScore(currentFP);
                     acceptedSinceResync = 0;
                 }
@@ -3028,12 +3625,14 @@ void runMatcherSweep_44(AppState* s)
     if (!s->stopRequested) {
         std::vector<std::vector<ToneTuple>> finalTuples = ToneListToToneTuples(fullList);
         s->player->SendToneTuples(finalTuples);
-        std::vector<int32_t> finalAudioI = s->player->GenerateWAVMonoI();
+
+        std::vector<int32_t> finalAudioI;
+        s->player->GenerateWAVMonoI(finalAudioI);
         {
             size_t pad = (finalAudioI.size() + 512) % 512;
             for (size_t p = 0; p < pad; p++) finalAudioI.push_back(0);
         }
-        std::vector<FingerprintFrame> finalFP    = FingerPrintI(finalAudioI);
+        std::vector<FingerprintFrame> finalFP    = FingerPrintI(finalAudioI, workspace);
         double                        finalScore  = FingerPrintMatch(finalFP, targetFP);
 
         std::lock_guard<std::mutex> lk(s->mtx);
@@ -3273,6 +3872,9 @@ int main(int argc, char** argv)
 
         ImGui::SetNextItemWidth(140.f);
         ImGui::SliderInt("ABC Tracks", &appState.numTracks, 1, 24);
+
+        ImGui::SetNextItemWidth(140.f);
+        ImGui::SliderInt("Engine Threads", &appState.numEngineThreads, 1, 16);
 
         static const double tempStepValues[4] = { 0.2, 0.02, 0.002, 0.0002 };
         static const char* tempStepLabels[4]  = { "0.2", "0.02", "0.002", "0.0002" };
